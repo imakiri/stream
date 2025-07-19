@@ -10,6 +10,7 @@ require (
 	github.com/klauspost/reedsolomon v1.11.8
 	github.com/pelletier/go-toml v1.9.5
 	github.com/stretchr/testify v1.8.4
+	golang.org/x/exp v0.0.0-20230801115018-d63ba01acd4b
 	gonum.org/v1/plot v0.14.0
 )
 
