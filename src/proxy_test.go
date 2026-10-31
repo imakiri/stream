@@ -1,12 +1,15 @@
 package src
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -187,6 +190,14 @@ func TestProxyConfigFromFile(t *testing.T) {
 		t.Errorf("proxy config %+v", cfg.Relay.Proxy)
 	}
 
+	cfg, err = LoadClientConfig(write("[relay]\n  network = \"tcp\"\n[proxy.http]\n  url = \"http://127.0.0.1:8080\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Relay.Proxy.HTTP == nil || cfg.Relay.Proxy.HTTP.URL != "http://127.0.0.1:8080" || cfg.Relay.Proxy.Socks5 != nil || cfg.Relay.Proxy.AmneziaWG != nil {
+		t.Errorf("proxy config %+v", cfg.Relay.Proxy)
+	}
+
 	// the layout before the relay was called relay
 	_, err = LoadClientConfig(write("[proxy]\n  addr = \"relay.example\"\n  port = 25565\n"))
 	if err == nil || !strings.Contains(err.Error(), "now called [relay]") {
@@ -206,11 +217,21 @@ func TestProxyConfigIsChecked(t *testing.T) {
 			Socks5:    &Socks5ProxyConfig{URL: "socks5://127.0.0.1:2080"},
 			AmneziaWG: &AmneziaWGProxyConfig{ConfigPath: "amneziawg.conf"},
 		}}},
+		{"socks5 and http", RelayConfig{Network: RelayNetworkTCP, Proxy: ProxyConfig{
+			Socks5: &Socks5ProxyConfig{URL: "socks5://127.0.0.1:2080"},
+			HTTP:   &HTTPProxyConfig{URL: "http://127.0.0.1:8080"},
+		}}},
 		{"socks5 over udp", RelayConfig{Network: RelayNetworkUDP, Proxy: ProxyConfig{
 			Socks5: &Socks5ProxyConfig{URL: "socks5://127.0.0.1:2080"},
 		}}},
+		{"http over udp", RelayConfig{Network: RelayNetworkUDP, Proxy: ProxyConfig{
+			HTTP: &HTTPProxyConfig{URL: "http://127.0.0.1:8080"},
+		}}},
 		{"missing amneziawg config", RelayConfig{Proxy: ProxyConfig{
 			AmneziaWG: &AmneziaWGProxyConfig{ConfigPath: filepath.Join(t.TempDir(), "none.conf")},
+		}}},
+		{"bad http proxy scheme", RelayConfig{Network: RelayNetworkTCP, Proxy: ProxyConfig{
+			HTTP: &HTTPProxyConfig{URL: "socks5://127.0.0.1:8080"},
 		}}},
 	} {
 		link, err := DialRelay(context.Background(), c.cfg, wire.RoleClient, uuid.Must(uuid.NewV4()))
@@ -218,5 +239,117 @@ func TestProxyConfigIsChecked(t *testing.T) {
 			_ = link.Close()
 			t.Errorf("%s: no error", c.name)
 		}
+	}
+}
+
+// TestRelayLinkThroughHTTPProxy registers a RelayLink over TCP at a fake
+// relay through a fake HTTP CONNECT proxy: the proxy checks the CONNECT
+// target and the Proxy-Authorization header, tunnels the bytes, the relay
+// echoes the relay hello and sends a data packet, which the link must read.
+func TestRelayLinkThroughHTTPProxy(t *testing.T) {
+	var data = []byte{wire.Version, byte(wire.KindData), 1, 2, 3}
+
+	relayListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayListener.Close()
+	go func() {
+		for {
+			conn, err := relayListener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				framed := frame.NewConn(conn)
+				defer framed.Close()
+				buf := make([]byte, packetBufferSize)
+				for {
+					n, err := framed.Read(buf)
+					if err != nil {
+						return
+					}
+					if wire.PacketKind(buf[:n]) == wire.KindRelayHello {
+						_, _ = framed.Write(buf[:n])
+						_, _ = framed.Write(data)
+					}
+				}
+			}()
+		}
+	}()
+
+	const username = "user"
+	const password = "pass"
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyListener.Close()
+	go func() {
+		for {
+			conn, err := proxyListener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				if req.Method != http.MethodConnect {
+					_, _ = conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+					return
+				}
+				if req.Header.Get("Proxy-Authorization") != wantAuth {
+					_, _ = conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
+					return
+				}
+				target, err := net.Dial("tcp", req.Host)
+				if err != nil {
+					_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+					return
+				}
+				defer target.Close()
+				if _, err := conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n")); err != nil {
+					return
+				}
+				go func() { _, _ = io.Copy(target, br) }()
+				_, _ = io.Copy(conn, target)
+			}()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	link, err := DialRelay(ctx, RelayConfig{
+		Network: RelayNetworkTCP,
+		Addr:    "127.0.0.1",
+		Port:    uint16(relayListener.Addr().(*net.TCPAddr).Port),
+		Proxy: ProxyConfig{HTTP: &HTTPProxyConfig{
+			URL: fmt.Sprintf("http://%s:%s@%s", username, password, proxyListener.Addr()),
+		}},
+	}, wire.RoleClient, uuid.Must(uuid.NewV4()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer link.Close()
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, packetBufferSize)
+		if n, err := link.Read(buf); err == nil {
+			got <- bytes.Clone(buf[:n])
+		}
+	}()
+	select {
+	case packet := <-got:
+		if !bytes.Equal(packet, data) {
+			t.Fatalf("read %x, want %x", packet, data)
+		}
+	case <-ctx.Done():
+		t.Fatal("no data from the relay through the http proxy")
 	}
 }
