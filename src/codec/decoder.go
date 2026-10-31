@@ -61,11 +61,25 @@ type Decoder struct {
 		err *uint64
 	}
 
+	// lostChunks counts the chunks the dispatcher skipped in the stream;
+	// incompleteChunks those of them the assembler gave up on with too few
+	// packets to restore. See Losses.
+	lostChunks       atomic.Uint64
+	incompleteChunks atomic.Uint64
+
 	argumentQueue chan []byte
 	assemblyQueue chan *PacketV2
 	restoreQueue  chan []*PacketV2
 	dispatchQueue chan *Chunk
 	resultQueue   chan DecodedChunk
+}
+
+// Losses returns the chunks lost since the decoder started: lost counts the
+// chunks skipped in the stream, incomplete those of them that came with too
+// few packets to restore (the others did not come at all). Burst losses on
+// the network show as several incomplete chunks of one interleave group.
+func (decoder *Decoder) Losses() (lost, incomplete uint64) {
+	return decoder.lostChunks.Load(), decoder.incompleteChunks.Load()
 }
 
 // DecodedChunk is the data of one restored chunk, in stream order.
@@ -175,7 +189,7 @@ dispatch:
 			if chunk.csn != decoder.dispatcher.awaiting {
 				var at = chunk.csn % decoder.dispatcher.size
 				if decoder.dispatcher.chunks[at] != nil {
-					log.Printf("dispatch: lost: csn: %d", decoder.dispatcher.awaiting)
+					decoder.lostChunks.Add(decoder.dispatcher.chunks[at].csn - decoder.dispatcher.awaiting)
 					atomic.AddUint64(decoder.dispatcher.err, 1)
 					select {
 					case <-ctx.Done():
@@ -344,8 +358,7 @@ assembly:
 			case line.csn == packet.csn:
 			case line.csn < packet.csn:
 				if line.found != 0 && !line.restored {
-					log.Printf("assembly: dropping chunk: csn: %d with %d of %d packets -> %d",
-						line.csn, line.found, decoder.restorer.data, packet.csn)
+					decoder.incompleteChunks.Add(1)
 					atomic.AddUint64(decoder.assembler.err, 1)
 				}
 				line.reuse(packet.csn)

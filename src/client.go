@@ -238,12 +238,14 @@ func (c *Client) serverNow() (time.Time, bool) {
 	return time.Now().Add(time.Duration(c.serverClockOffsetNanos.Load())), true
 }
 
-// reportStream logs the end-to-end delay every e2eDelayReportInterval while
-// data comes, and once when the data stops or comes again.
+// reportStream logs the end-to-end delay and the lost chunks every
+// e2eDelayReportInterval while data comes, and once when the data stops or
+// comes again.
 func (c *Client) reportStream(ctx context.Context) {
 	var ticker = time.NewTicker(e2eDelayReportInterval)
 	defer ticker.Stop()
 	var flow dataFlow
+	var reportedLost, reportedIncomplete uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -252,8 +254,10 @@ func (c *Client) reportStream(ctx context.Context) {
 			if change := flow.update(c.lastDataUnixNano.Load(), now); change != "" {
 				log.Print(change)
 			}
+			var lost, incomplete = c.decoder.Losses()
 			if samples := c.e2eDelays.take(); len(samples) > 0 {
-				log.Print(formatE2EDelays(samples))
+				log.Print(formatStreamReport(samples, lost-reportedLost, incomplete-reportedIncomplete))
+				reportedLost, reportedIncomplete = lost, incomplete
 			}
 		}
 	}

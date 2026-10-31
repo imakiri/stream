@@ -81,6 +81,7 @@ func startTestServer(t *testing.T, ctx context.Context, proxyCfg ProxyConfig, ro
 	server, err := NewServer(ServerConfig{
 		Proxy:           proxyCfg,
 		StreamInputPort: inputPort,
+		PacingRate:      DefaultPacingRate,
 		Fec:             testFec,
 		Encoder:         EncoderConfig{DispatcherTimeout: 5 * time.Millisecond, DispatcherSize: 2},
 		Credentials:     creds,

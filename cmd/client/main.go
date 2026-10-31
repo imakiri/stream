@@ -1,7 +1,7 @@
 // Command client is a viewer: it gets the stream from the server through the
 // proxy, restores it with FEC and sends it to a local player over UDP, e.g.
 //
-//	ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop "udp://127.0.0.1:25566?overrun_nonfatal=1"
+//	ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop -sync ext "udp://127.0.0.1:25566?overrun_nonfatal=1"
 //
 // On the first start it makes its key in the key directory (by default next
 // to the binary), prints the public key and copies it to the clipboard. Send

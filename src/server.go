@@ -36,6 +36,7 @@ type DecoderConfig struct {
 type ServerConfig struct {
 	Proxy           ProxyConfig
 	StreamInputPort uint16 // local UDP port OBS sends the mpegts stream to
+	PacingRate      uint64 // bits per second the data packets are spread at; 0: sent as the encoder hands them over
 	Fec             FecConfig
 	Encoder         EncoderConfig
 	Credentials     wire.Credentials
@@ -135,12 +136,15 @@ func (s *Server) readStreamInput(ctx context.Context, streamInput net.PacketConn
 	}
 }
 
-// sendStream seals every FEC packet into a data packet for the proxy.
-// The link drops packets while it is down and logs its own failures, so a
-// write error means it is closed.
+// sendStream seals every FEC packet into a data packet for the proxy, paced
+// at cfg.PacingRate. The link drops packets while it is down and logs its
+// own failures, so a write error means it is closed.
 func (s *Server) sendStream(link io.Writer, encoderOut <-chan []byte) {
+	var pacer = newPacer(s.cfg.PacingRate)
 	for packet := range encoderOut {
-		if _, err := link.Write(s.sealer.SealData(packet)); err != nil {
+		var data = s.sealer.SealData(packet)
+		pacer.wait(len(data))
+		if _, err := link.Write(data); err != nil {
 			return
 		}
 	}

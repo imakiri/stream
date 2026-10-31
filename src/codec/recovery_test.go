@@ -120,3 +120,24 @@ func TestChunkUnmarshalRejectsSizeBeyondParts(t *testing.T) {
 	}
 	require.False(t, new(Chunk).Unmarshal(parts))
 }
+
+// TestDecoderCountsLosses loses one chunk short of packets and one whole
+// chunk: both count as lost, the first also as incomplete.
+func TestDecoderCountsLosses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const chunks, assemblerLines = 40, 16 // lines are reused, so short chunks get given up
+	decoder, err := NewDecoder(recoveryDataParts, recoveryTotalParts, assemblerLines, 12)
+	require.NoError(t, err)
+	decoderIn, decoderOut, err := decoder.Decode(ctx)
+	require.NoError(t, err)
+
+	const shortCsn, missingCsn = 5, 9
+	_, got := recoveryRun(t, ctx, decoderIn, decoderOut, chunks, func(p *PacketV2) bool {
+		return p.csn == shortCsn && p.psn < recoveryTotalParts-recoveryDataParts+1 || p.csn == missingCsn
+	})
+	require.Len(t, got, chunks-2)
+	lost, incomplete := decoder.Losses()
+	require.Equal(t, uint64(2), lost, "lost chunks")
+	require.Equal(t, uint64(1), incomplete, "incomplete chunks")
+}

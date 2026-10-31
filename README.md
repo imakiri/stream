@@ -92,6 +92,16 @@ interleaved, so a burst loss spreads over several chunks. Each packet carries
 the chunk and packet numbers, a random session per encoder run and an 8-byte
 SHA-1 prefix.
 
+The encoder hands over the packets of an interleave group at once (40 with
+the defaults). Sent back to back they leave at the speed of the network card,
+and a shaper on the way (home router, provider) cuts off the tail of the
+burst: 15-25 packets in a row, more than FEC restores. So the server paces the
+data packets (`src/pacer.go`, `[pacing] rate_mbit` in `server.cfg`, 30 Mbit/s
+by default, about three times the wire rate). The proxy forwards each packet
+as it comes, so this smooths the way to the clients too. The price is the
+time a big frame takes at that rate: ~25 ms for a 75 KB keyframe with its
+parity, ~5 ms for an ordinary frame.
+
 The decoder collects packets per chunk in a ring of `assembler_size` lines,
 restores a chunk as soon as `data_parts` packets are there and puts chunks
 back in order in a window of `dispatcher_size` chunks; a chunk that does not
@@ -106,7 +116,10 @@ The encoder stamps each chunk with the server time its first byte came in;
 the server hello carries the server clock, and the client estimates the clock
 offset from it and the handshake round trip. Every 5 s the client logs the
 end-to-end delay, from the chunk reaching the server to the chunk restored on
-the client: `e2e delay p50 …, p99 …, max …`.
+the client, and the chunks lost meanwhile:
+`e2e delay p50 …, p99 …, max … over N chunks, lost K (M came short of packets)`.
+Chunks that came short of packets in groups of neighbours mean burst losses
+on the way; whole chunks missing mean longer breaks.
 
 ## Running it
 
@@ -213,16 +226,20 @@ next to the binary), `-sign <key>` and `-days <n>`.
    `client.enrollment`. Next starts connect right away.
 3. Start the player:
    ```
-   ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop "udp://127.0.0.1:25566?overrun_nonfatal=1&fifo_size=1024&buffer_size=98304"
+   ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop -sync ext "udp://127.0.0.1:25566?overrun_nonfatal=1&fifo_size=1024&buffer_size=98304"
    ```
-   (`play.bat` in the Windows release does this.) The client sends the
+   (`play.bat` in the Windows release does this.) `-sync ext` keeps the
+   picture on its own clock: by default ffplay follows the audio, and with
+   `-framedrop` it then throws away most video frames of a live stream as
+   late, which looks like stutter. The client sends the
    stream to this local UDP port and the player reads whatever arrives
    there; UDP has no listen mode or connection, so the two can start in any
    order and the player can be restarted while the client runs. While no
    player is open, the client drops the stream and logs that once.
 
 The client log shows the handshake with the clock offset to the server
-(again only when the stream key changes), the end-to-end delay every 5 s, and
+(again only when the stream key changes), the end-to-end delay and the lost
+chunks every 5 s, and
 one line when the data from the server stops or comes again: a server without
 input from OBS answers handshakes but sends no data. The speed of what comes
 from the proxy stays on the bottom line of the terminal.
