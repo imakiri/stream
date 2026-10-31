@@ -194,7 +194,7 @@ func TestProxyFollowsUDPPeerToNewPort(t *testing.T) {
 func TestProxyDropsSilentUDPPeer(t *testing.T) {
 	var addr = freeAddr(t)
 	var p = New(addr, uilive.New())
-	p.udpPeerTimeout = 1500 * time.Millisecond
+	p.peerTimeout = 1500 * time.Millisecond
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -228,5 +228,40 @@ func TestProxyKeepsOneServer(t *testing.T) {
 	var peers = p.appendPeers(nil)
 	if len(peers) != 1 || peers[0].id != newServerID {
 		t.Fatalf("want only the new server, got %d peers", len(peers))
+	}
+}
+
+// TestProxyEchoesTCPKeepalive checks that a repeated hello over TCP comes
+// back: the peer checks its link by the echoes.
+func TestProxyEchoesTCPKeepalive(t *testing.T) {
+	_, addr := startProxy(t)
+	var id = uuid.Must(uuid.NewV4())
+	var conn = connectTCP(t, addr, wire.RoleClient, id)
+	var hello = wire.MarshalProxyHello(wire.RoleClient, id)
+	if _, err := conn.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	expectPacket(t, conn, hello, "keepalive echo")
+}
+
+// TestProxyDropsSilentTCPPeer checks that a TCP peer without keepalives is
+// disconnected after the timeout.
+func TestProxyDropsSilentTCPPeer(t *testing.T) {
+	var addr = freeAddr(t)
+	var p = New(addr, uilive.New())
+	p.peerTimeout = 500 * time.Millisecond
+	if err := p.Serve(); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	var conn = connectTCP(t, addr, wire.RoleClient, uuid.Must(uuid.NewV4()))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var buf = make([]byte, packetBufferSize)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("silent tcp peer was not disconnected")
+	}
+	if peers := p.appendPeers(nil); len(peers) != 0 {
+		t.Fatalf("%d peers left", len(peers))
 	}
 }

@@ -24,10 +24,15 @@ const packetBufferSize = 1<<16 - 1
 
 const tcpWriteTimeout = time.Second
 
-// UDPPeerTimeout drops a UDP peer that sent nothing, not even a keepalive
-// proxy hello (src.KeepaliveInterval), for this long. A TCP peer is dropped
-// when its connection closes instead.
-const UDPPeerTimeout = 30 * time.Second
+// PeerTimeout drops a peer that sent nothing, not even a keepalive proxy
+// hello (src.KeepaliveInterval), for this long, over UDP and TCP. A TCP peer
+// is also dropped when its connection closes.
+const PeerTimeout = 30 * time.Second
+
+// unknownPeerLogInterval limits the log of packets from unknown UDP peers: a
+// server whose registration the proxy lost, e.g. after a proxy restart, sends
+// a thousand data packets a second until its next hello.
+const unknownPeerLogInterval = 5 * time.Second
 
 // Peer is one connected server or client. A peer is reached either over UDP,
 // by the address its last proxy hello came from, or over TCP, through its
@@ -81,7 +86,7 @@ type Proxy struct {
 	udpConn     *net.UDPConn
 	tcpListener net.Listener
 
-	udpPeerTimeout time.Duration
+	peerTimeout time.Duration
 
 	addr                string
 	speedOutput         *uilive.Writer
@@ -92,7 +97,7 @@ type Proxy struct {
 }
 
 func New(addr string, speedOutput *uilive.Writer) *Proxy {
-	return &Proxy{addr: addr, speedOutput: speedOutput, udpPeerTimeout: UDPPeerTimeout}
+	return &Proxy{addr: addr, speedOutput: speedOutput, peerTimeout: PeerTimeout}
 }
 
 // addPeer registers the peer, replacing a previous connection with the same
@@ -188,7 +193,9 @@ func (p *Proxy) route(from *Peer, packet []byte, peers []*Peer) []*Peer {
 	p.totalReceived.Add(uint64(len(packet)))
 	switch wire.PacketKind(packet) {
 	case wire.KindProxyHello:
-		// a repeated hello over TCP: nothing to route
+		// A keepalive over TCP: echo it, the peer checks the link by the
+		// echoes. UDP hellos never get here, serveUDP answers them.
+		p.send(from, packet)
 	case wire.KindClientHello:
 		if from.role != wire.RoleClient {
 			break
@@ -224,6 +231,8 @@ func (p *Proxy) route(from *Peer, packet []byte, peers []*Peer) []*Peer {
 func (p *Proxy) serveUDP() {
 	var buf = make([]byte, packetBufferSize)
 	var peers []*Peer
+	var unknownPeerLoggedAt time.Time
+	var unknownPeerPackets int
 	for {
 		n, addr, err := p.udpConn.ReadFromUDP(buf)
 		if err != nil {
@@ -259,7 +268,11 @@ func (p *Proxy) serveUDP() {
 
 		var from = p.findUDPPeer(addr)
 		if from == nil {
-			log.Printf("dropped udp packet from unknown peer at %s", addr)
+			unknownPeerPackets++
+			if now := time.Now(); now.Sub(unknownPeerLoggedAt) > unknownPeerLogInterval {
+				log.Printf("dropped %d udp packets from unknown peers, the last from %s", unknownPeerPackets, addr)
+				unknownPeerLoggedAt, unknownPeerPackets = now, 0
+			}
 			continue
 		}
 		from.seen(time.Now())
@@ -314,6 +327,7 @@ func (p *Proxy) serveTCPConn(conn net.Conn) {
 
 	var peers []*Peer
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(p.peerTimeout))
 		n, err := framed.Read(buf)
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) {
@@ -326,7 +340,8 @@ func (p *Proxy) serveTCPConn(conn net.Conn) {
 	}
 }
 
-// expireUDPPeers drops UDP peers that went silent for udpPeerTimeout.
+// expireUDPPeers drops UDP peers that went silent for peerTimeout; a silent
+// TCP peer runs into the read deadline in serveTCPConn.
 func (p *Proxy) expireUDPPeers() {
 	var ticker = time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -342,7 +357,7 @@ func (p *Proxy) expireUDPPeers() {
 					continue
 				}
 				var silent = now.Sub(time.Unix(0, peer.lastSeenUnixNano.Load()))
-				if silent > p.udpPeerTimeout {
+				if silent > p.peerTimeout {
 					log.Printf("%s silent for %s", peer, silent.Round(time.Second))
 					p.removePeer(peer)
 				}

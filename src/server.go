@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"time"
@@ -91,14 +92,15 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var output net.Conn = link
+	defer link.Close()
+	var output io.ReadWriter = link
 	if s.cfg.OutputReporter != nil {
 		writer, err := observer.NewWriter(link, s.cfg.OutputReporter, time.Second)
 		if err != nil {
 			return err
 		}
 		defer writer.Close()
-		output = &writeObservedConn{Conn: link, writer: writer}
+		output = &writeObservedLink{ReadWriter: link, writer: writer}
 	}
 
 	encoderIn, encoderOut, err := s.encoder.Encode(ctx)
@@ -134,30 +136,30 @@ func (s *Server) readStreamInput(ctx context.Context, streamInput net.PacketConn
 }
 
 // sendStream seals every FEC packet into a data packet for the proxy.
-func (s *Server) sendStream(link net.Conn, encoderOut <-chan []byte) {
+// The link drops packets while it is down and logs its own failures, so a
+// write error means it is closed.
+func (s *Server) sendStream(link io.Writer, encoderOut <-chan []byte) {
 	for packet := range encoderOut {
 		if _, err := link.Write(s.sealer.SealData(packet)); err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			log.Printf("failed to send stream to proxy: %s", err)
+			return
 		}
 	}
 }
 
 // answerHandshakes answers every client hello the proxy hands over.
-func (s *Server) answerHandshakes(link net.Conn) {
+func (s *Server) answerHandshakes(link io.ReadWriter) {
 	var buf = make([]byte, packetBufferSize)
 	for {
 		n, err := link.Read(buf)
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				log.Printf("failed to read from proxy: %s", err)
-			}
+		if errors.Is(err, net.ErrClosed) {
 			return
 		}
+		if err != nil {
+			log.Printf("failed to read from proxy: %s", err)
+			continue
+		}
 		if wire.PacketKind(buf[:n]) != wire.KindClientHello {
-			continue // proxy hello echoes
+			continue
 		}
 		serverHello, clientID, err := s.handshake.AnswerClientHello(buf[:n], time.Now())
 		if err != nil {
@@ -165,29 +167,28 @@ func (s *Server) answerHandshakes(link net.Conn) {
 			continue
 		}
 		if _, err := link.Write(serverHello); err != nil {
-			log.Printf("failed to answer client %s: %s", clientID, err)
-			continue
+			return
 		}
 		log.Printf("handshake with client %s", clientID)
 	}
 }
 
-// writeObservedConn counts what is written to Conn through an observer.
-type writeObservedConn struct {
-	net.Conn
+// writeObservedLink counts what is written to the link through an observer.
+type writeObservedLink struct {
+	io.ReadWriter
 	writer *observer.Writer
 }
 
-func (c *writeObservedConn) Write(p []byte) (int, error) {
+func (c *writeObservedLink) Write(p []byte) (int, error) {
 	return c.writer.Write(p)
 }
 
-// readObservedConn counts what is read from Conn through an observer.
-type readObservedConn struct {
-	net.Conn
+// readObservedLink counts what is read from the link through an observer.
+type readObservedLink struct {
+	io.ReadWriter
 	reader *observer.Reader
 }
 
-func (c *readObservedConn) Read(p []byte) (int, error) {
+func (c *readObservedLink) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }

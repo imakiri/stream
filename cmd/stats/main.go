@@ -21,9 +21,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"time"
@@ -73,7 +75,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	conn, err := src.DialProxy(ctx, src.ProxyConfig{
+	link, err := src.DialProxy(ctx, src.ProxyConfig{
 		Network:    src.ProxyNetwork(*network),
 		SocksProxy: *socks,
 		Addr:       *addr,
@@ -85,9 +87,19 @@ func main() {
 
 	switch role {
 	case wire.RoleServer:
-		err = write(ctx, conn, *rate)
+		// Nothing comes to the writer, but the link takes the proxy's hello
+		// echoes in Read and dials again without them.
+		go func() {
+			var buf = make([]byte, 1<<16-1)
+			for {
+				if _, err := link.Read(buf); errors.Is(err, net.ErrClosed) {
+					return
+				}
+			}
+		}()
+		err = write(ctx, link, *rate)
 	case wire.RoleClient:
-		err = read(conn, *out)
+		err = read(link, *out)
 	}
 	if err != nil && ctx.Err() == nil {
 		log.Fatalln(err)
@@ -96,7 +108,7 @@ func main() {
 
 // write sends packets on a fixed schedule, so the sender's sleep jitter does
 // not add up into the measurement.
-func write(ctx context.Context, conn interface{ Write([]byte) (int, error) }, rate int) error {
+func write(ctx context.Context, link interface{ Write([]byte) (int, error) }, rate int) error {
 	if rate <= 0 {
 		return fmt.Errorf("rate %d, want a positive number of packets per second", rate)
 	}
@@ -112,14 +124,14 @@ func write(ctx context.Context, conn interface{ Write([]byte) (int, error) }, ra
 		binary.BigEndian.PutUint64(packet[6:wire.DataHeaderSize], number)
 		_, _ = rand.Read(packet[statsSendTimeOffset+8:])
 		binary.BigEndian.PutUint64(packet[statsSendTimeOffset:], uint64(time.Now().UnixNano()))
-		if _, err := conn.Write(packet); err != nil {
+		if _, err := link.Write(packet); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func read(conn interface{ Read([]byte) (int, error) }, path string) error {
+func read(link interface{ Read([]byte) (int, error) }, path string) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -139,13 +151,13 @@ func read(conn interface{ Read([]byte) (int, error) }, path string) error {
 	var report = time.NewTicker(5 * time.Second)
 	defer report.Stop()
 	for {
-		n, err := conn.Read(buf)
+		n, err := link.Read(buf)
 		if err != nil {
-			return err // DialProxy closes conn when ctx is done
+			return err // the link is closed: ctx is done
 		}
 		var receivedAt = time.Now().UnixNano()
 		var packet = buf[:n]
-		// the proxy echoes the keepalive hellos; only data is measured
+		// only data is measured
 		if wire.PacketKind(packet) != wire.KindData || len(packet) < statsSendTimeOffset+8 {
 			continue
 		}

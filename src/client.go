@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync/atomic"
@@ -85,14 +86,15 @@ func (c *Client) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var input net.Conn = link
+	defer link.Close()
+	var input io.ReadWriter = link
 	if c.cfg.InputReporter != nil {
 		reader, err := observer.NewReader(link, c.cfg.InputReporter, time.Second)
 		if err != nil {
 			return err
 		}
 		defer reader.Close()
-		input = &readObservedConn{Conn: link, reader: reader}
+		input = &readObservedLink{ReadWriter: link, reader: reader}
 	}
 
 	decoderIn, decoderOut, err := c.decoder.Decode(ctx)
@@ -114,7 +116,7 @@ func (c *Client) streamWorks(now time.Time) bool {
 
 // keepHandshake sends client hellos while the client has no working stream
 // key: at start, after the server restarted, after a long outage.
-func (c *Client) keepHandshake(ctx context.Context, link net.Conn) {
+func (c *Client) keepHandshake(ctx context.Context, link io.Writer) {
 	var ticker = time.NewTicker(clientHelloRetryInterval)
 	defer ticker.Stop()
 	var hello []byte
@@ -132,8 +134,8 @@ func (c *Client) keepHandshake(ctx context.Context, link net.Conn) {
 				c.opener.Store(nil)
 			}
 			if hello != nil {
-				if _, err := link.Write(hello); err != nil && !errors.Is(err, net.ErrClosed) {
-					log.Printf("failed to send client hello: %s", err)
+				if _, err := link.Write(hello); err != nil {
+					return // closed; the link logs its own send failures
 				}
 			}
 		}
@@ -146,15 +148,16 @@ func (c *Client) keepHandshake(ctx context.Context, link net.Conn) {
 }
 
 // receive takes server hellos and data packets from the proxy.
-func (c *Client) receive(ctx context.Context, link net.Conn, decoderIn chan<- []byte) {
+func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- []byte) {
 	var buf = make([]byte, packetBufferSize)
 	for {
 		n, err := link.Read(buf)
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				log.Printf("failed to read from proxy: %s", err)
-			}
+		if errors.Is(err, net.ErrClosed) {
 			return
+		}
+		if err != nil {
+			log.Printf("failed to read from proxy: %s", err)
+			continue
 		}
 		switch wire.PacketKind(buf[:n]) {
 		case wire.KindServerHello:

@@ -303,3 +303,37 @@ func TestStreamClientFollowsRestartedServer(t *testing.T) {
 	inputPort = startTestServer(t, ctx, udp, root, serverCreds)
 	streamUntilPlayed(t, inputPort, firstStream, 16<<10, player)
 }
+
+// TestStreamSurvivesProxyRestart restarts the proxy, which forgets every
+// peer and, over TCP, breaks their connections, and checks that the server
+// and the client register again and the stream plays on.
+func TestStreamSurvivesProxyRestart(t *testing.T) {
+	for _, network := range []ProxyNetwork{ProxyNetworkUDP, ProxyNetworkTCP} {
+		t.Run(string(network), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			addr, port := freeProxyAddr(t)
+			var proxyAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
+			var p = proxy.New(proxyAddr, uilive.New())
+			if err := p.Serve(); err != nil {
+				t.Fatal(err)
+			}
+
+			var root = newTestRoot(t)
+			var serverCreds = root.issue(t)
+			var link = ProxyConfig{Network: network, Addr: addr, Port: port}
+			var inputPort = startTestServer(t, ctx, link, root, serverCreds)
+			var player = startTestPlayer(t, ctx, link, root.pub, root.issue(t), serverCreds.Certificate.ID)
+			var firstStream = streamUntilPlayed(t, inputPort, nil, 16<<10, player)
+
+			p.Close()
+			time.Sleep(300 * time.Millisecond)
+			p = proxy.New(proxyAddr, uilive.New())
+			if err := p.Serve(); err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			streamUntilPlayed(t, inputPort, firstStream, 16<<10, player)
+		})
+	}
+}
