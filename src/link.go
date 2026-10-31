@@ -138,7 +138,9 @@ func dialProxyNetwork(ctx context.Context, cfg ProxyConfig, socks *url.URL) (net
 		}
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
-			_ = tcpConn.SetReadBuffer(socketBufferSize)
+			// No SetReadBuffer here, unlike UDP: a fixed SO_RCVBUF turns off
+			// the kernel's window autotuning and caps TCP at buffer/RTT, e.g.
+			// about 2.4 Mbit/s with socketBufferSize at 92 ms.
 			if socks == nil {
 				// through a socks proxy the mark would only reach the local hop to it
 				markRealTime(conn)
