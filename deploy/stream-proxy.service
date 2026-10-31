@@ -1,0 +1,17 @@
+[Unit]
+Description=imakiri/stream proxy: relays the stream between the server and its clients
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/stream/proxy -addr 0.0.0.0:25565
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
