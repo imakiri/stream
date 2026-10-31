@@ -1,451 +1,208 @@
 package src
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"github.com/go-faster/errors"
-	"github.com/gofrs/uuid/v5"
-	codec2 "github.com/imakiri/stream/src/codec"
-	"github.com/imakiri/stream/src/frame"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/proxy"
-	"io"
 	"log"
 	"net"
-	"net/url"
-	"os"
-	"slices"
-	"strconv"
-	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/gofrs/uuid/v5"
+	"github.com/imakiri/stream/src/codec"
+	"github.com/imakiri/stream/src/observer"
+	"github.com/imakiri/stream/src/wire"
 )
 
-// packetBufferSize fits one packet from OBS or the server (secure.Writer packets are 1084 bytes).
-const packetBufferSize = 1500
-
-// ServerNetwork is the transport between the client and the relay server.
-// The local side towards OBS is always UDP.
-type ServerNetwork string
+// ClientConfig configures a client: a viewer that gets the stream from the
+// server through the proxy and hands it to a local player such as ffplay.
+type ClientConfig struct {
+	Proxy         ProxyConfig
+	PlayerPort    uint16 // local UDP port the player reads the mpegts stream from
+	Fec           FecConfig
+	Decoder       DecoderConfig
+	Credentials   wire.Credentials
+	Verifier      wire.CertificateVerifier
+	ServerID      uuid.UUID         // the server's certificate ID; no other certificate may serve the stream
+	InputReporter observer.Reporter // optional: speed of what comes from the proxy
+}
 
 const (
-	ServerNetworkUDP ServerNetwork = "udp"
-	ServerNetworkTCP ServerNetwork = "tcp"
+	// clientHelloRetryInterval is how often a client repeats its hello while
+	// it has no working stream key.
+	clientHelloRetryInterval = time.Second
+	// clientHelloAttemptTimeout starts a new attempt, with a new ephemeral
+	// key, when the server did not answer the current one.
+	clientHelloAttemptTimeout = 5 * time.Second
+	// streamStaleTimeout starts a new handshake when no data packet opened
+	// for this long, e.g. the server restarted with a new stream key.
+	streamStaleTimeout = 3 * time.Second
 )
 
-var UID = uuid.Must(uuid.FromString("1751b2a1-0ffd-44fe-8a2e-d3f153125c43")).Bytes()
-
-type Stat struct {
-	ID       uint64
-	Sent     int64
-	Received int64
-}
-
+// Client handshakes with the server, opens the data packets with the stream
+// key, restores the stream with FEC and sends it to the player.
 type Client struct {
-	stats *os.File
+	cfg       ClientConfig
+	decoder   *codec.Decoder
+	handshake wire.ClientHandshaker
 
-	serverNetwork ServerNetwork
-	proxyAddr     *url.URL // TCP only
-
-	portCaller   uint16
-	portListener uint16
-
-	serverPort uint16
-	serverAddr string
-
-	acceptedLocalAddrMu *sync.Cond
-	acceptedLocalAddr   *net.UDPAddr
-
-	decoder *codec2.Decoder
-	encoder *codec2.Encoder
-
-	writer io.WriteCloser
-	reader io.ReadCloser
-
-	serverConn   net.Conn // *frame.Conn after the handshake over TCP
-	callerConn   *net.UDPConn
-	listenerConn *net.UDPConn
+	opener           atomic.Pointer[wire.StreamOpener]
+	lastOpenUnixNano atomic.Int64
 }
 
-func (client *Client) connect(ctx context.Context, peerID uuid.UUID) error {
-	var ok bool
-
-	{
-		var localConfig = net.ListenConfig{
-			Control:   nil,
-			KeepAlive: 0,
-		}
-
-		var listener, err = localConfig.ListenPacket(ctx, "udp4", fmt.Sprintf("127.0.0.1:%d", client.portListener))
-		if err != nil {
-			return errors.Wrap(err, "connect: localConfig.ListenPacket")
-		}
-
-		client.listenerConn, ok = listener.(*net.UDPConn)
-		if !ok {
-			return errors.New("connect: listener.(*net.UDPConn) is not ok")
-		}
-
-		log.Println("local listener at", client.listenerConn.LocalAddr().String())
-		client.listenerConn.SetWriteBuffer(20 * (codec2.PacketV2Size + 12))
+func NewClient(cfg ClientConfig) (*Client, error) {
+	if cfg.ServerID == uuid.Nil {
+		return nil, errors.New("server id is not set")
 	}
-	{
-		var dialer = net.Dialer{
-			Timeout:        0,
-			Deadline:       time.Time{},
-			LocalAddr:      nil,
-			FallbackDelay:  0,
-			KeepAlive:      0,
-			Resolver:       nil,
-			Control:        nil,
-			ControlContext: nil,
-		}
-
-		var caller, err = dialer.DialContext(ctx, "udp4", fmt.Sprintf("127.0.0.1:%d", client.portCaller))
-		if err != nil {
-			return errors.Wrap(err, "connect: dialer.DialContext")
-		}
-
-		var ok bool
-		client.callerConn, ok = caller.(*net.UDPConn)
-		if !ok {
-			return errors.New("connect: caller.(*net.UDPConn) is not ok")
-		}
-
-		log.Println("local caller to", client.callerConn.RemoteAddr().String())
-		client.callerConn.SetWriteBuffer(20 * (codec2.PacketV2Size + 12))
+	decoder, err := codec.NewDecoder(cfg.Fec.DataParts, cfg.Fec.TotalParts, cfg.Decoder.AssemblerSize, cfg.Decoder.DispatcherSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create decoder: %w", err)
 	}
+	return &Client{
+		cfg:     cfg,
+		decoder: decoder,
+		handshake: &wire.CertificateClientHandshake{
+			Credentials: cfg.Credentials,
+			Verifier:    cfg.Verifier,
+			ServerID:    cfg.ServerID,
+		},
+	}, nil
+}
 
-	var err error
-	client.serverConn, err = client.dialServer(ctx)
+// Run plays the stream until ctx is done.
+func (c *Client) Run(ctx context.Context) error {
+	var dialer net.Dialer
+	player, err := dialer.DialContext(ctx, "udp4", fmt.Sprintf("127.0.0.1:%d", c.cfg.PlayerPort))
+	if err != nil {
+		return fmt.Errorf("failed to dial the player: %w", err)
+	}
+	defer player.Close()
+	_ = player.(*net.UDPConn).SetWriteBuffer(socketBufferSize)
+	log.Printf("sending the stream to the player at udp/%s", player.RemoteAddr())
+
+	link, err := DialProxy(ctx, c.cfg.Proxy, wire.RoleClient, c.cfg.Credentials.Certificate.ID)
 	if err != nil {
 		return err
 	}
-	var serverConn, callerConn, listenerConn = client.serverConn, client.callerConn, client.listenerConn
-	go func() {
-		<-ctx.Done()
-		serverConn.Close()
-		callerConn.Close()
-		listenerConn.Close()
-	}()
+	var input net.Conn = link
+	if c.cfg.InputReporter != nil {
+		reader, err := observer.NewReader(link, c.cfg.InputReporter, time.Second)
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+		input = &readObservedConn{Conn: link, reader: reader}
+	}
 
-	var hello = append(slices.Clone(UID), peerID.Bytes()...)
-	err = client.handshake(hello)
+	decoderIn, decoderOut, err := c.decoder.Decode(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to start decoder: %w", err)
 	}
 
-	switch client.serverNetwork {
-	case ServerNetworkTCP:
-		// TCP is a byte stream: frame the packets so the reader gets them whole.
-		client.serverConn = frame.NewConn(client.serverConn)
-	case ServerNetworkUDP:
-		// The server knows a UDP peer only by the address its hello came from,
-		// and NATs and tunnels change that address: repeat the hello.
-		client.serverConn = &helloEchoFilterConn{Conn: client.serverConn, hello: hello}
-		go sendKeepaliveHellos(ctx, client.serverConn, hello)
-	}
+	go c.keepHandshake(ctx, link)
+	go c.receive(ctx, input, decoderIn)
+	go c.play(player, decoderOut)
 
-	log.Printf("server at %s/%s", client.serverNetwork, client.serverConn.RemoteAddr())
-	log.Printf("handshake done")
+	<-ctx.Done()
 	return nil
 }
 
-// dialServer connects to the relay server over the configured network,
-// through the proxy for TCP if one is set.
-func (client *Client) dialServer(ctx context.Context) (net.Conn, error) {
-	var addr = net.JoinHostPort(client.serverAddr, strconv.Itoa(int(client.serverPort)))
-	var dialer = &net.Dialer{}
+func (c *Client) streamWorks(now time.Time) bool {
+	return c.opener.Load() != nil && now.Sub(time.Unix(0, c.lastOpenUnixNano.Load())) < streamStaleTimeout
+}
 
-	switch client.serverNetwork {
-	case ServerNetworkUDP:
-		conn, err := dialer.DialContext(ctx, "udp4", addr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to dial server at udp/%s: %w", addr, err)
+// keepHandshake sends client hellos while the client has no working stream
+// key: at start, after the server restarted, after a long outage.
+func (c *Client) keepHandshake(ctx context.Context, link net.Conn) {
+	var ticker = time.NewTicker(clientHelloRetryInterval)
+	defer ticker.Stop()
+	var hello []byte
+	var helloAt time.Time
+	for {
+		var now = time.Now()
+		if !c.streamWorks(now) {
+			if hello == nil || now.Sub(helloAt) > clientHelloAttemptTimeout || c.opener.Load() != nil {
+				var err error
+				hello, err = c.handshake.NewClientHello()
+				if err != nil {
+					log.Printf("failed to create client hello: %s", err)
+				}
+				helloAt = now
+				c.opener.Store(nil)
+			}
+			if hello != nil {
+				if _, err := link.Write(hello); err != nil && !errors.Is(err, net.ErrClosed) {
+					log.Printf("failed to send client hello: %s", err)
+				}
+			}
 		}
-		_ = conn.(*net.UDPConn).SetReadBuffer(20 * (codec2.PacketV2Size + 12))
-		markRealTime(conn)
-		return conn, nil
-	case ServerNetworkTCP:
-		var contextDialer proxy.ContextDialer = dialer
-		if client.proxyAddr != nil {
-			proxyDialer, err := proxy.FromURL(client.proxyAddr, dialer)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// receive takes server hellos and data packets from the proxy.
+func (c *Client) receive(ctx context.Context, link net.Conn, decoderIn chan<- []byte) {
+	var buf = make([]byte, packetBufferSize)
+	for {
+		n, err := link.Read(buf)
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				log.Printf("failed to read from proxy: %s", err)
+			}
+			return
+		}
+		switch wire.PacketKind(buf[:n]) {
+		case wire.KindServerHello:
+			opener, err := c.handshake.FinishServerHello(buf[:n], time.Now())
 			if err != nil {
-				return nil, fmt.Errorf("failed to create proxy dialer for %s: %w", client.proxyAddr.Redacted(), err)
+				log.Printf("rejected server hello: %s", err)
+				continue
 			}
-			var ok bool
-			contextDialer, ok = proxyDialer.(proxy.ContextDialer)
-			if !ok {
-				return nil, fmt.Errorf("proxy dialer for %s does not support context", client.proxyAddr.Redacted())
+			c.lastOpenUnixNano.Store(time.Now().UnixNano())
+			c.opener.Store(&opener)
+			log.Printf("handshake with server %s, stream key epoch %08x", c.cfg.ServerID, opener.Epoch())
+		case wire.KindData:
+			var opener = c.opener.Load()
+			if opener == nil {
+				continue
 			}
-		}
-		conn, err := contextDialer.DialContext(ctx, "tcp4", addr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to dial server at tcp/%s: %w", addr, err)
-		}
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.SetNoDelay(true)
-			_ = tcpConn.SetReadBuffer(20 * (codec2.PacketV2Size + 12))
-			if client.proxyAddr == nil {
-				// through a proxy the mark would only reach the local hop to it
-				markRealTime(conn)
+			payload, err := (*opener).OpenData(buf[:n])
+			if err != nil {
+				continue // another stream key until the handshake catches up, or forged
 			}
-		}
-		return conn, nil
-	default:
-		return nil, fmt.Errorf("unknown server network %q", client.serverNetwork)
-	}
-}
-
-// dscpExpeditedForwarding is the DSCP class EF (46) for real-time traffic.
-// The internet mostly ignores or clears it, but home routers and Wi-Fi (WMM)
-// put such packets into the voice/video queue, ahead of bulk downloads.
-const dscpExpeditedForwarding = 46
-
-// markRealTime sets DSCP EF on the packets sent over conn. DSCP is the upper
-// 6 bits of the IPv4 TOS byte. Windows ignores the socket option unless a
-// Policy-based QoS rule sets DSCP for the executable.
-func markRealTime(conn net.Conn) {
-	if err := ipv4.NewConn(conn).SetTOS(dscpExpeditedForwarding << 2); err != nil {
-		log.Printf("failed to set dscp %d on %s/%s: %s", dscpExpeditedForwarding, conn.LocalAddr().Network(), conn.LocalAddr(), err)
-	}
-}
-
-// handshake sends the hello (UID + peer ID) to the server, unframed on both
-// networks, and waits for the server to echo it back.
-func (client *Client) handshake(hello []byte) error {
-	if _, err := client.serverConn.Write(hello); err != nil {
-		return fmt.Errorf("failed to send handshake to server: %w", err)
-	}
-
-	var answer = make([]byte, packetBufferSize)
-	var n int
-	var err error
-	if client.serverNetwork == ServerNetworkTCP {
-		n, err = io.ReadFull(client.serverConn, answer[:len(hello)])
-	} else {
-		n, err = client.serverConn.Read(answer)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to read handshake from server at %s: %w", client.serverConn.RemoteAddr(), err)
-	}
-	if !bytes.Equal(answer[:n], hello) {
-		return errors.Errorf("server answered handshake with %d unexpected bytes", n)
-	}
-	return nil
-}
-
-func (client *Client) routeIn(ctx context.Context) {
-	var decoderIn, decoderOut, _ = client.decoder.Decode(ctx)
-	//routeIn:
-	go func() {
-		var buf []byte
-		for {
+			c.lastOpenUnixNano.Store(time.Now().UnixNano())
 			select {
 			case <-ctx.Done():
 				return
-			default:
-				buf = make([]byte, packetBufferSize)
-				n, err := client.reader.Read(buf)
-				if err != nil {
-					log.Printf("routeIn: reader.Read: %v", err)
-					return
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case decoderIn <- buf[:n]:
-				}
+			case decoderIn <- payload:
 			}
 		}
-	}()
-	go func() {
-		var buf []byte
-		var ok bool
-		var err error
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case buf, ok = <-decoderOut:
-				if !ok {
-					return
-				}
-				_, err = client.callerConn.Write(buf)
-				if err != nil {
-					log.Printf("routeIn: callerConn.Write: %v", err)
-					return
-				}
+	}
+}
 
-				if client.acceptedLocalAddr != nil {
-					_, err = client.listenerConn.WriteToUDP(buf, client.acceptedLocalAddr)
-					if err != nil {
-						log.Printf("routeIn: callerConn.Write: %v", err)
-						return
-					}
+// playerDatagramSize is 7 mpegts packets of 188 bytes, the usual datagram of
+// mpegts over UDP: the player gets the restored chunks in such pieces rather
+// than as one datagram per chunk, which would exceed the MTU of anything but
+// loopback and the default buffers of players like ffplay.
+const playerDatagramSize = 7 * 188
+
+// play sends the restored stream to the player.
+func (c *Client) play(player net.Conn, decoderOut <-chan []byte) {
+	for data := range decoderOut {
+		for len(data) > 0 {
+			var piece = data[:min(len(data), playerDatagramSize)]
+			data = data[len(piece):]
+			if _, err := player.Write(piece); err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
 				}
+				log.Printf("failed to send to the player: %s", err)
 			}
 		}
-	}()
-}
-
-func (client *Client) routeOut(ctx context.Context) {
-	var encodeIn, encoderOut, _ = client.encoder.Encode(ctx)
-	//routeOut:
-	go func() {
-		var buf []byte
-		var err error
-		var addr *net.UDPAddr
-		var n int
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				buf = make([]byte, packetBufferSize)
-				n, addr, err = client.listenerConn.ReadFromUDP(buf)
-				if err != nil {
-					log.Printf("routeOut: listenerConn.ReadFromUDP: %v", err)
-					return
-				}
-
-				client.acceptedLocalAddr = addr
-
-				select {
-				case <-ctx.Done():
-					return
-				case encodeIn <- buf[:n]:
-				}
-			}
-		}
-	}()
-	go func() {
-		var buf []byte
-		var ok bool
-		var err error
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case buf, ok = <-encoderOut:
-				if !ok {
-					return
-				}
-				_, err = client.writer.Write(buf)
-				if err != nil {
-					log.Printf("routeOut: writer.Write: %v", err)
-					return
-				}
-			}
-		}
-	}()
-}
-
-type Handler interface {
-	// The server connection carries whole packets: one Read or Write is one packet.
-	Reader(server net.Conn) (io.ReadCloser, error)
-	Writer(server net.Conn) (io.WriteCloser, error)
-}
-
-func (client *Client) Run(ctx context.Context, peerID uuid.UUID, handler Handler) error {
-	var err error
-
-	err = client.connect(ctx, peerID)
-	if err != nil {
-		return errors.Wrap(err, "client.connect")
 	}
-
-	client.writer, err = handler.Writer(client.serverConn)
-	if err != nil {
-		return errors.Wrap(err, "writer")
-	}
-
-	client.reader, err = handler.Reader(client.serverConn)
-	if err != nil {
-		return errors.Wrap(err, "reader")
-	}
-
-	var i int
-	for err = errors.New(""); err != nil; i++ {
-		client.stats, err = os.Create(fmt.Sprintf("stats_%d", i))
-	}
-
-	go client.routeIn(ctx)
-	go client.routeOut(ctx)
-	return nil
-}
-
-type Config struct {
-	Peer struct {
-		ID           string
-		Mode         string
-		PortCaller   uint16
-		PortListener uint16
-	}
-	Server struct {
-		Network ServerNetwork // "udp" (default) or "tcp"
-		Proxy   string        // proxy URL, e.g. socks5://127.0.0.1:2080; TCP only
-		Port    uint16
-		Addr    string
-	}
-	Fec struct {
-		DataParts  uint64
-		TotalParts uint64
-	}
-	Encoder struct {
-		DispatcherTimeout uint64
-		DispatcherSize    uint64
-	}
-	Decoder struct {
-		AssemblerSize  uint64
-		DispatcherSize uint64
-	}
-}
-
-func NewClient(cfg *Config) (*Client, error) {
-	var client = new(Client)
-	var err error
-
-	client.serverNetwork = cfg.Server.Network
-	switch client.serverNetwork {
-	case "":
-		client.serverNetwork = ServerNetworkUDP
-	case ServerNetworkUDP, ServerNetworkTCP:
-	default:
-		return nil, fmt.Errorf("unknown server network %q, want %q or %q", cfg.Server.Network, ServerNetworkUDP, ServerNetworkTCP)
-	}
-
-	if cfg.Server.Proxy != "" {
-		if client.serverNetwork != ServerNetworkTCP {
-			return nil, fmt.Errorf("server proxy works only over %q, server network is %q", ServerNetworkTCP, client.serverNetwork)
-		}
-		client.proxyAddr, err = url.Parse(cfg.Server.Proxy)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse proxy url: %w", err)
-		}
-	}
-	client.encoder, err = codec2.NewEncoder(
-		time.Duration(cfg.Encoder.DispatcherTimeout)*time.Millisecond,
-		cfg.Encoder.DispatcherSize,
-		cfg.Fec.DataParts,
-		cfg.Fec.TotalParts,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "codec.NewEncoder")
-	}
-	client.decoder, err = codec2.NewDecoder(
-		cfg.Fec.DataParts,
-		cfg.Fec.TotalParts,
-		cfg.Decoder.AssemblerSize,
-		cfg.Decoder.DispatcherSize,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "codec.NewEncoder")
-	}
-	client.serverPort = cfg.Server.Port
-	client.serverAddr = cfg.Server.Addr
-	client.portCaller = cfg.Peer.PortCaller
-	client.portListener = cfg.Peer.PortListener
-	client.acceptedLocalAddrMu = sync.NewCond(new(sync.Mutex))
-	return client, nil
 }

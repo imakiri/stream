@@ -2,9 +2,11 @@ package observer
 
 import (
 	"bytes"
-	"github.com/stretchr/testify/require"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 type testSrc struct {
@@ -20,7 +22,9 @@ func (t testSrc) Close() error {
 	return nil
 }
 
+// testReporter is called from the reader's goroutine and read by the test.
 type testReporter struct {
+	mu   sync.Mutex
 	data [][2]uint64
 }
 
@@ -31,7 +35,15 @@ func newTestReporter() *testReporter {
 }
 
 func (t *testReporter) Report(total, delta uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.data = append(t.data, [2]uint64{total, delta})
+}
+
+func (t *testReporter) reports() [][2]uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([][2]uint64(nil), t.data...)
 }
 
 func TestReader(t *testing.T) {
@@ -45,10 +57,10 @@ func TestReader(t *testing.T) {
 	require.NoError(t, err)
 
 	time.Sleep(500 * time.Millisecond)
-	t.Log(rep.data)
+	t.Log(rep.reports())
 
 	var buf0 = [][2]uint64{{0, 0}}
-	require.Equal(t, buf0, rep.data)
+	require.Equal(t, buf0, rep.reports())
 
 	var buf = make([]byte, 3)
 	var n int
@@ -58,18 +70,18 @@ func TestReader(t *testing.T) {
 	require.Equal(t, 3, n)
 
 	time.Sleep(time.Second)
-	t.Log(rep.data)
+	t.Log(rep.reports())
 
 	var buf1 = [][2]uint64{{0, 0}, {3, 3}}
-	require.Equal(t, buf1, rep.data)
+	require.Equal(t, buf1, rep.reports())
 
 	n, err = reader.Read(buf)
 	require.NoError(t, err)
 	require.Equal(t, 3, n)
 
 	time.Sleep(time.Second)
-	t.Log(rep.data)
+	t.Log(rep.reports())
 
 	var buf2 = [][2]uint64{{0, 0}, {3, 3}, {6, 3}}
-	require.Equal(t, buf2, rep.data)
+	require.Equal(t, buf2, rep.reports())
 }
