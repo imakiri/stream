@@ -107,3 +107,87 @@ func TestServerRelaysBetweenUDPAndTCPPeers(t *testing.T) {
 		}
 	}
 }
+
+// udpHello dials the server over UDP and completes the handshake for peerID.
+func udpHello(t *testing.T, addr string, peerID uuid.UUID) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("udp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	var h = hello(peerID)
+	if _, err := conn.Write(h); err != nil {
+		t.Fatal(err)
+	}
+	var buf = make([]byte, packetBufferSize)
+	n, err := conn.Read(buf)
+	if err != nil || !bytes.Equal(buf[:n], h) {
+		t.Fatalf("udp handshake: %q, %v", buf[:n], err)
+	}
+	return conn
+}
+
+// TestServerFollowsUDPPeerToNewPort repeats a peer's hello from another
+// socket, as after a NAT rebinding or a tunnel exit change, and checks that
+// packets for the peer go to the new address from then on.
+func TestServerFollowsUDPPeerToNewPort(t *testing.T) {
+	var addr = freeAddr(t)
+	var server = NewServer(addr, uilive.New())
+	if err := server.Serve(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	var movingID = uuid.Must(uuid.NewV4())
+	var oldConn = udpHello(t, addr, movingID)
+	defer oldConn.Close()
+	var sender = udpHello(t, addr, uuid.Must(uuid.NewV4()))
+	defer sender.Close()
+
+	var newConn = udpHello(t, addr, movingID)
+	defer newConn.Close()
+
+	var packet = bytes.Repeat([]byte{7}, 1084)
+	if _, err := sender.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	var buf = make([]byte, packetBufferSize)
+	n, err := newConn.Read(buf)
+	if err != nil || !bytes.Equal(buf[:n], packet) {
+		t.Fatalf("new address: %d bytes, %v", n, err)
+	}
+	_ = oldConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, err := oldConn.Read(buf); err == nil {
+		t.Fatalf("old address still gets packets: %d bytes", n)
+	}
+}
+
+// TestServerDropsSilentUDPPeer checks that a UDP peer without keepalives is
+// removed after the timeout, while one that keeps saying hello stays.
+func TestServerDropsSilentUDPPeer(t *testing.T) {
+	var addr = freeAddr(t)
+	var server = NewServer(addr, uilive.New())
+	server.udpPeerTimeout = 1500 * time.Millisecond
+	if err := server.Serve(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	var silent = udpHello(t, addr, uuid.Must(uuid.NewV4()))
+	defer silent.Close()
+	var aliveID = uuid.Must(uuid.NewV4())
+	var alive = udpHello(t, addr, aliveID)
+	defer alive.Close()
+
+	for range 6 {
+		time.Sleep(500 * time.Millisecond)
+		if _, err := alive.Write(hello(aliveID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var peers = server.appendPeers(nil)
+	if len(peers) != 1 || peers[0].id != aliveID {
+		t.Fatalf("want only the peer with keepalives, got %d peers", len(peers))
+	}
+}

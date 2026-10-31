@@ -28,6 +28,11 @@ const packetBufferSize = 1<<16 - 1
 
 const tcpWriteTimeout = time.Second
 
+// udpPeerTimeout drops a UDP peer that sent nothing, not even a keepalive
+// hello (src.KeepaliveInterval), for this long. A TCP peer is dropped when its
+// connection closes instead.
+const udpPeerTimeout = 30 * time.Second
+
 // Peer is one connected client. A peer is reached either over UDP, by the
 // address its handshake came from, or over TCP, through its framed connection.
 type Peer struct {
@@ -35,6 +40,12 @@ type Peer struct {
 	addr    net.Addr
 	udpAddr *net.UDPAddr // set for UDP peers
 	tcpConn *frame.Conn  // set for TCP peers
+
+	lastSeenUnixNano atomic.Int64 // UDP peers: when the last packet came from udpAddr
+}
+
+func (p *Peer) seen(now time.Time) {
+	p.lastSeenUnixNano.Store(now.UnixNano())
 }
 
 func (p *Peer) network() string {
@@ -63,6 +74,8 @@ type Server struct {
 	udpConn     *net.UDPConn
 	tcpListener net.Listener
 
+	udpPeerTimeout time.Duration
+
 	addr                string
 	logger              *uilive.Writer
 	totalReceivedBefore uint64
@@ -72,7 +85,7 @@ type Server struct {
 }
 
 func NewServer(addr string, logger *uilive.Writer) *Server {
-	return &Server{addr: addr, logger: logger}
+	return &Server{addr: addr, logger: logger, udpPeerTimeout: udpPeerTimeout}
 }
 
 // addPeer registers the peer, replacing a previous connection with the same ID.
@@ -186,8 +199,16 @@ func (s *Server) serveUDP() {
 		}
 
 		if peerID := parseHandshake(buf[:n]); peerID != uuid.Nil {
-			if !s.addPeer(&Peer{id: peerID, addr: addr, udpAddr: addr}) {
-				return
+			// A hello is both the first handshake and the keepalive: the
+			// same peer from the same address only refreshes lastSeen.
+			if peer := s.findUDPPeer(addr); peer != nil && peer.id == peerID {
+				peer.seen(time.Now())
+			} else {
+				var peer = &Peer{id: peerID, addr: addr, udpAddr: addr}
+				peer.seen(time.Now())
+				if !s.addPeer(peer) {
+					return
+				}
 			}
 			if _, err := s.udpConn.WriteToUDP(buf[:n], addr); err != nil {
 				log.Printf("failed to answer udp handshake from %s: %s", addr, err)
@@ -200,6 +221,7 @@ func (s *Server) serveUDP() {
 			log.Printf("dropped udp packet from unknown peer at %s", addr)
 			continue
 		}
+		from.seen(time.Now())
 		peers = s.relay(from, buf[:n], peers)
 	}
 }
@@ -261,6 +283,31 @@ func (s *Server) serveTCPConn(conn net.Conn) {
 	}
 }
 
+// expireUDPPeers drops UDP peers that went silent for udpPeerTimeout.
+func (s *Server) expireUDPPeers() {
+	var ticker = time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var peers []*Peer
+	for {
+		select {
+		case <-s.done:
+			return
+		case now := <-ticker.C:
+			peers = s.appendPeers(peers[:0])
+			for _, peer := range peers {
+				if peer.udpAddr == nil {
+					continue
+				}
+				var silent = now.Sub(time.Unix(0, peer.lastSeenUnixNano.Load()))
+				if silent > s.udpPeerTimeout {
+					log.Printf("peer %s at udp/%s silent for %s", peer.id, peer.addr, silent.Round(time.Second))
+					s.removePeer(peer)
+				}
+			}
+		}
+	}
+}
+
 func (s *Server) reportSpeed() {
 	var ticker = time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -309,6 +356,7 @@ func (s *Server) Serve() error {
 	s.tcpListener = tcpListener
 
 	s.wg.Go(s.reportSpeed)
+	s.wg.Go(s.expireUDPPeers)
 	s.wg.Go(s.serveUDP)
 	s.wg.Go(s.serveTCP)
 	return nil

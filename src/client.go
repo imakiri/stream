@@ -129,14 +129,21 @@ func (client *Client) connect(ctx context.Context, peerID uuid.UUID) error {
 		listenerConn.Close()
 	}()
 
-	err = client.handshake(peerID)
+	var hello = append(slices.Clone(UID), peerID.Bytes()...)
+	err = client.handshake(hello)
 	if err != nil {
 		return err
 	}
 
-	if client.serverNetwork == ServerNetworkTCP {
+	switch client.serverNetwork {
+	case ServerNetworkTCP:
 		// TCP is a byte stream: frame the packets so the reader gets them whole.
 		client.serverConn = frame.NewConn(client.serverConn)
+	case ServerNetworkUDP:
+		// The server knows a UDP peer only by the address its hello came from,
+		// and NATs and tunnels change that address: repeat the hello.
+		client.serverConn = &helloEchoFilterConn{Conn: client.serverConn, hello: hello}
+		go sendKeepaliveHellos(ctx, client.serverConn, hello)
 	}
 
 	log.Printf("server at %s/%s", client.serverNetwork, client.serverConn.RemoteAddr())
@@ -206,8 +213,7 @@ func markRealTime(conn net.Conn) {
 
 // handshake sends the hello (UID + peer ID) to the server, unframed on both
 // networks, and waits for the server to echo it back.
-func (client *Client) handshake(peerID uuid.UUID) error {
-	var hello = append(slices.Clone(UID), peerID.Bytes()...)
+func (client *Client) handshake(hello []byte) error {
 	if _, err := client.serverConn.Write(hello); err != nil {
 		return fmt.Errorf("failed to send handshake to server: %w", err)
 	}
