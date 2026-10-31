@@ -3,6 +3,9 @@ package src
 import (
 	"bytes"
 	"crypto/ed25519"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -96,4 +99,46 @@ func publicKeyFromPrompt(t *testing.T, output string) string {
 	}
 	t.Fatalf("no public key in:\n%s", output)
 	return ""
+}
+
+// TestKeyFilesArePrivate checks the key files are readable by their owner
+// only, and that a client refuses an enrollment made for another key.
+func TestKeyFilesArePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes do not apply on windows")
+	}
+	copyToClipboard = func(string) error { return nil }
+	var serverDir, clientDir = t.TempDir(), t.TempDir()
+	server, err := LoadOrCreateServerIdentity(serverDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	_, _ = LoadOrEnrollClientIdentity(clientDir, strings.NewReader(""), &out)
+	for _, path := range []string{
+		filepath.Join(serverDir, caKeyFile), filepath.Join(serverDir, serverKeyFile), filepath.Join(serverDir, serverCertFile),
+		filepath.Join(clientDir, clientKeyFile),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("%s has mode %o, want 600", filepath.Base(path), mode)
+		}
+	}
+
+	// an enrollment for someone else's key is refused at the prompt
+	var otherKey, _, _ = ed25519.GenerateKey(nil)
+	foreign, _, err := server.EnrollClient(wire.EncodeBase64(otherKey), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if _, err := LoadOrEnrollClientIdentity(clientDir, strings.NewReader(foreign+"\n"), &out); err == nil {
+		t.Fatal("the client took an enrollment for another key")
+	}
+	if !strings.Contains(out.String(), "not an enrollment of this client") {
+		t.Fatalf("no refusal in the prompt output: %q", out.String())
+	}
 }

@@ -337,3 +337,98 @@ func TestStreamSurvivesProxyRestart(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamClientPlaysNothingForged lets an attacker who knows only the
+// proxy address take the server's place there, as the proxy authenticates
+// nobody, and send data packets with the real stream's epoch, which it read
+// as a client. The client must play none of it, and the stream must come back
+// once the real server repeats its registration.
+func TestStreamClientPlaysNothingForged(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addr, port := freeProxyAddr(t)
+	var proxyAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
+	var p = proxy.New(proxyAddr, uilive.New())
+	if err := p.Serve(); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	var root = newTestRoot(t)
+	var serverCreds = root.issue(t)
+	var udp = ProxyConfig{Network: ProxyNetworkUDP, Addr: addr, Port: port}
+	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
+	var player = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
+
+	// the attacker listens as a client for the epoch while the stream runs
+	var spy = dialRawProxy(t, proxyAddr, wire.RoleClient)
+	var epoch = make(chan []byte, 1)
+	go func() {
+		var buf = make([]byte, packetBufferSize)
+		for {
+			n, err := spy.Read(buf)
+			if err != nil {
+				return
+			}
+			if wire.PacketKind(buf[:n]) == wire.KindData && n >= wire.DataHeaderSize {
+				epoch <- bytes.Clone(buf[2:6])
+				return
+			}
+		}
+	}()
+	var firstStream = streamUntilPlayed(t, inputPort, nil, 16<<10, player)
+	var streamEpoch = <-epoch
+
+	// OBS is quiet now; the player may still get the end of the real stream,
+	// but nothing else
+	time.Sleep(500 * time.Millisecond)
+	var played = make(chan []byte, 1)
+	go func() {
+		var got bytes.Buffer
+		var buf = make([]byte, packetBufferSize)
+		_ = player.SetReadDeadline(time.Now().Add(2500 * time.Millisecond))
+		for {
+			n, err := player.Read(buf)
+			if err != nil {
+				played <- got.Bytes()
+				return
+			}
+			got.Write(buf[:n])
+		}
+	}()
+	var hijacker = dialRawProxy(t, proxyAddr, wire.RoleServer)
+	var forged = make([]byte, 1086)
+	for i := range 2000 {
+		_, _ = rand.Read(forged)
+		forged[0], forged[1] = wire.Version, byte(wire.KindData)
+		copy(forged[2:6], streamEpoch)
+		_, _ = hijacker.Write(forged)
+		if i%100 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if got := <-played; !bytes.Contains(firstStream, got) {
+		t.Fatalf("the player got %d bytes that the server did not send", len(got))
+	} else if len(got) > 0 {
+		t.Logf("the player got %d late bytes of the real stream during the attack", len(got))
+	}
+	_ = player.SetReadDeadline(time.Time{})
+
+	// the server's next keepalive takes its place back
+	streamUntilPlayed(t, inputPort, firstStream, 16<<10, player)
+}
+
+// dialRawProxy registers a bare UDP socket at the proxy, the way anyone who
+// knows its address can.
+func dialRawProxy(t *testing.T, proxyAddr string, role wire.Role) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("udp4", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := exchangeProxyHello(conn, wire.MarshalProxyHello(role, uuid.Must(uuid.NewV4())), proxyHelloUDPAttempts); err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}

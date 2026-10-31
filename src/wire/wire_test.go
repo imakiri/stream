@@ -24,7 +24,7 @@ type testPKI struct {
 	rootPub ed25519.PublicKey
 }
 
-func newTestPKI(t *testing.T) testPKI {
+func newTestPKI(t testing.TB) testPKI {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -33,7 +33,7 @@ func newTestPKI(t *testing.T) testPKI {
 	return testPKI{root: priv, rootPub: pub}
 }
 
-func (p testPKI) issue(t *testing.T, notAfter time.Time) Credentials {
+func (p testPKI) issue(t testing.TB, notAfter time.Time) Credentials {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -78,7 +78,7 @@ type handshakePair struct {
 	key    StreamKey
 }
 
-func newHandshakePair(t *testing.T, pki testPKI, server, client Credentials) handshakePair {
+func newHandshakePair(t testing.TB, pki testPKI, server, client Credentials) handshakePair {
 	t.Helper()
 	key, err := NewStreamKey()
 	if err != nil {
