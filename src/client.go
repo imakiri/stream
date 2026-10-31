@@ -8,6 +8,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 	codec2 "github.com/imakiri/stream/src/codec"
 	"github.com/imakiri/stream/src/frame"
+	"golang.org/x/net/ipv4"
 	"golang.org/x/net/proxy"
 	"io"
 	"log"
@@ -156,6 +157,7 @@ func (client *Client) dialServer(ctx context.Context) (net.Conn, error) {
 			return nil, fmt.Errorf("failed to dial server at udp/%s: %w", addr, err)
 		}
 		_ = conn.(*net.UDPConn).SetReadBuffer(20 * (codec2.PacketV2Size + 12))
+		markRealTime(conn)
 		return conn, nil
 	case ServerNetworkTCP:
 		var contextDialer proxy.ContextDialer = dialer
@@ -177,10 +179,28 @@ func (client *Client) dialServer(ctx context.Context) (net.Conn, error) {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
 			_ = tcpConn.SetReadBuffer(20 * (codec2.PacketV2Size + 12))
+			if client.proxyAddr == nil {
+				// through a proxy the mark would only reach the local hop to it
+				markRealTime(conn)
+			}
 		}
 		return conn, nil
 	default:
 		return nil, fmt.Errorf("unknown server network %q", client.serverNetwork)
+	}
+}
+
+// dscpExpeditedForwarding is the DSCP class EF (46) for real-time traffic.
+// The internet mostly ignores or clears it, but home routers and Wi-Fi (WMM)
+// put such packets into the voice/video queue, ahead of bulk downloads.
+const dscpExpeditedForwarding = 46
+
+// markRealTime sets DSCP EF on the packets sent over conn. DSCP is the upper
+// 6 bits of the IPv4 TOS byte. Windows ignores the socket option unless a
+// Policy-based QoS rule sets DSCP for the executable.
+func markRealTime(conn net.Conn) {
+	if err := ipv4.NewConn(conn).SetTOS(dscpExpeditedForwarding << 2); err != nil {
+		log.Printf("failed to set dscp %d on %s/%s: %s", dscpExpeditedForwarding, conn.LocalAddr().Network(), conn.LocalAddr(), err)
 	}
 }
 
