@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid/v5"
-	"github.com/imakiri/stream/src/codec"
 	"github.com/imakiri/stream/src/frame"
 	"github.com/imakiri/stream/src/wire"
 	"golang.org/x/net/ipv4"
@@ -26,8 +25,14 @@ import (
 // packetBufferSize fits any wire packet and any datagram from OBS.
 const packetBufferSize = 1<<16 - 1
 
-// socketBufferSize is the kernel buffer for about 20 packets in flight.
-const socketBufferSize = 20 * (codec.PacketV2Size + wire.DataOverhead)
+// socketBufferSize is the kernel buffer of the UDP sockets to the proxy and
+// to the player. The encoder sends the packets of an interleave group, 40 at
+// the default settings, back to back, and the receive buffer must take such
+// a burst whole: with 20 packets it dropped a few of every group even on
+// loopback, and every chunk lost that way held the decoder for its reorder
+// window, about 100 ms. 1 MiB holds about ten groups; Linux caps it at
+// net.core.rmem_max. The buffer adds no delay while the reader keeps up.
+const socketBufferSize = 1 << 20
 
 // ProxyNetwork is the transport between a peer and the proxy. The local side
 // towards OBS or the player is always UDP.
