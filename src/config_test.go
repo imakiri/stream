@@ -3,6 +3,8 @@ package src
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -63,5 +65,45 @@ func TestClockConfig(t *testing.T) {
 		if server.NTPServer != c.want || client.NTPServer != c.want {
 			t.Errorf("%s: ntp server %q in the server, %q in the client, want %q", c.name, server.NTPServer, client.NTPServer, c.want)
 		}
+	}
+}
+
+// TestClientConfigFileRoundTrip writes client configs back as the Android
+// app does and reads them again: the example, the defaults and one with a
+// proxy.
+func TestClientConfigFileRoundTrip(t *testing.T) {
+	example, err := os.ReadFile(filepath.Join("..", "cmd", "client", "client.example.cfg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exampleFile, err := ParseClientConfigFile(example)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var withProxy = DefaultClientConfigFile()
+	withProxy.Relay.Addr = "relay.example"
+	withProxy.Proxy.AmneziaWG = &AmneziaWGConfigFile{Config: "amneziawg.conf"}
+	withProxy.Clock.NTPServer = "time.google.com"
+	for name, f := range map[string]ClientConfigFile{"example": exampleFile, "default": DefaultClientConfigFile(), "with a proxy": withProxy} {
+		text, err := f.Marshal()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		again, err := ParseClientConfigFile(text)
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, text)
+		}
+		if !reflect.DeepEqual(again, f) {
+			t.Errorf("%s: read back %+v, want %+v\n%s", name, again, f, text)
+		}
+	}
+	var defaults = DefaultClientConfigFile()
+	defaults.Relay.Addr = exampleFile.Relay.Addr
+	if !reflect.DeepEqual(exampleFile, defaults) {
+		t.Errorf("the defaults %+v differ from the example config %+v", defaults, exampleFile)
+	}
+	text, _ := withProxy.Marshal()
+	if strings.Contains(string(text), "socks5") || strings.Contains(string(text), "[proxy.http]") {
+		t.Errorf("unset proxies are written:\n%s", text)
 	}
 }

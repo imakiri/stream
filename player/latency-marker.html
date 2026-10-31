@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<!--
+Latency marker: draws the time of each screen frame as a barcode, for the
+Android app's screen-to-screen measurement. Open it in a browser window in the
+top left quarter of the captured screen; the app finds the barcode in the
+picture, reads the time and compares it with the true time (NTP) the frame
+reached the phone's screen. The time is this PC's clock, so keep it synced
+(timedatectl timesync-status).
+
+Barcode: two rows of square cells on a white quiet zone.
+  row 0: 42 cells alternating black, white, ... - the grid the reader finds
+  row 1: 40 cells of data, black = 1, most significant bit first:
+         the low 32 bits of the unix time in ms, then CRC-8 (poly 0x07) of
+         those 4 bytes, big endian; 2 white cells pad it to 42
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>stream latency marker</title>
+<style>
+  html, body { margin: 0; background: #fff; overflow: hidden; }
+  canvas { display: block; }
+  #text { font: 20px monospace; padding: 4px 16px; color: #000; }
+</style>
+</head>
+<body>
+<canvas id="marker"></canvas>
+<div id="text"></div>
+<script>
+const CELL = 16;       // CSS px; about 12 px in a 1920-wide stream of a 2560 screen
+const CELLS = 42;
+const QUIET = 2;       // cells of white around the code
+const canvas = document.getElementById("marker");
+const text = document.getElementById("text");
+const ctx = canvas.getContext("2d");
+
+function resize() {
+  const ratio = window.devicePixelRatio || 1;
+  const w = (CELLS + 2 * QUIET) * CELL, h = (2 + 2 * QUIET) * CELL;
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  canvas.width = Math.round(w * ratio);
+  canvas.height = Math.round(h * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+}
+
+function crc8(bytes) {
+  let crc = 0;
+  for (const b of bytes) {
+    crc ^= b;
+    for (let i = 0; i < 8; i++) crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+  }
+  return crc;
+}
+
+function bits(ms) {
+  const low = ms % 4294967296; // 2^32
+  const bytes = [(low >>> 24) & 0xff, (low >>> 16) & 0xff, (low >>> 8) & 0xff, low & 0xff];
+  bytes.push(crc8(bytes));
+  const out = [];
+  for (const b of bytes) for (let i = 7; i >= 0; i--) out.push((b >>> i) & 1);
+  return out; // 40
+}
+
+function draw(frameTime) {
+  // the frame's time: rAF gives when this frame started, on the page's clock
+  const ms = Math.round(performance.timeOrigin + frameTime);
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#000";
+  const x0 = QUIET * CELL, y0 = QUIET * CELL;
+  for (let i = 0; i < CELLS; i += 2) ctx.fillRect(x0 + i * CELL, y0, CELL, CELL);
+  const data = bits(ms);
+  for (let i = 0; i < data.length; i++) if (data[i]) ctx.fillRect(x0 + i * CELL, y0 + CELL, CELL, CELL);
+  text.textContent = new Date(ms).toISOString().slice(11, 23);
+  requestAnimationFrame(draw);
+}
+
+resize();
+window.addEventListener("resize", resize);
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

@@ -1,6 +1,8 @@
 package src
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,30 +15,35 @@ import (
 // cmd/client/client.example.cfg. They hold the network, FEC and clock settings only:
 // keys and certificates are files in the key directory, see keystore.go.
 
-type relayConfigFile struct {
+// RelayConfigFile is the [relay] section.
+type RelayConfigFile struct {
 	Addr    string `toml:"addr"`
 	Port    uint16 `toml:"port"`
 	Network string `toml:"network"` // "udp" (default) or "tcp"
 }
 
-// proxyConfigFile is the [proxy] section: [proxy.socks5], [proxy.http] or
+// ProxyConfigFile is the [proxy] section: [proxy.socks5], [proxy.http] or
 // [proxy.amneziawg], at most one. TOML has no union types, so each kind is
 // a sub-table and an absent one decodes to nil.
-type proxyConfigFile struct {
-	Socks5 *struct {
-		URL string `toml:"url"`
-	} `toml:"socks5"`
-	HTTP *struct {
-		URL string `toml:"url"`
-	} `toml:"http"`
-	AmneziaWG *struct {
-		Config string `toml:"config"` // path, relative to the directory of the config file
-	} `toml:"amneziawg"`
+type ProxyConfigFile struct {
+	Socks5    *ProxyURLConfigFile  `toml:"socks5,omitempty"`
+	HTTP      *ProxyURLConfigFile  `toml:"http,omitempty"`
+	AmneziaWG *AmneziaWGConfigFile `toml:"amneziawg,omitempty"`
+}
+
+// ProxyURLConfigFile is [proxy.socks5] or [proxy.http].
+type ProxyURLConfigFile struct {
+	URL string `toml:"url"`
+}
+
+// AmneziaWGConfigFile is [proxy.amneziawg].
+type AmneziaWGConfigFile struct {
+	Config string `toml:"config"` // path, relative to the directory of the config file
 }
 
 // relayConfig makes the RelayConfig of the [relay] and [proxy] sections of
 // the config file at configPath.
-func relayConfig(relay relayConfigFile, proxy proxyConfigFile, configPath string) RelayConfig {
+func relayConfig(relay RelayConfigFile, proxy ProxyConfigFile, configPath string) RelayConfig {
 	var cfg = RelayConfig{Network: RelayNetwork(relay.Network), Addr: relay.Addr, Port: relay.Port}
 	if proxy.Socks5 != nil {
 		cfg.Proxy.Socks5 = &Socks5ProxyConfig{URL: proxy.Socks5.URL}
@@ -54,46 +61,54 @@ func relayConfig(relay relayConfigFile, proxy proxyConfigFile, configPath string
 	return cfg
 }
 
-type fecConfigFile struct {
+// FecConfigFile is the [fec] section.
+type FecConfigFile struct {
 	DataParts  uint64 `toml:"data_parts"`
 	TotalParts uint64 `toml:"total_parts"`
 }
 
-func (f fecConfigFile) config() FecConfig {
+func (f FecConfigFile) config() FecConfig {
 	return FecConfig{DataParts: f.DataParts, TotalParts: f.TotalParts}
 }
 
-// clockConfigFile is the [clock] section: the NTP server both ends take the
+// ClockConfigFile is the [clock] section: the NTP server both ends take the
 // time from for the end-to-end delay.
-type clockConfigFile struct {
-	NTPServer string `toml:"ntp_server"` // empty or not in the file: no NTP
+type ClockConfigFile struct {
+	NTPServer string `toml:"ntp_server,omitempty"` // empty or not in the file: no NTP
 }
 
-// loadConfigFile decodes the config at path into dst. Unknown keys are an
-// error, so a typo or a section of an older layout is not silently ignored.
+// loadConfigFile decodes the config at path into dst, see decodeConfig.
 func loadConfigFile(path string, dst any) error {
-	file, err := os.Open(path)
+	text, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read config %s: %w", path, err)
 	}
-	defer file.Close()
-	if err := toml.NewDecoder(file).Strict(true).Decode(dst); err != nil {
-		if tree, treeErr := toml.LoadFile(path); treeErr == nil && tree.Has("proxy.addr") {
-			return fmt.Errorf("failed to parse config %s: the [proxy] section with the relay address is now called [relay]; [proxy] is for a socks5 or amneziawg proxy, see the example config", path)
-		}
+	if err := decodeConfig(text, dst); err != nil {
 		return fmt.Errorf("failed to parse config %s: %w", path, err)
+	}
+	return nil
+}
+
+// decodeConfig decodes a config into dst. Unknown keys are an error, so a
+// typo or a section of an older layout is not silently ignored.
+func decodeConfig(text []byte, dst any) error {
+	if err := toml.NewDecoder(bytes.NewReader(text)).Strict(true).Decode(dst); err != nil {
+		if tree, treeErr := toml.LoadBytes(text); treeErr == nil && tree.Has("proxy.addr") {
+			return errors.New("the [proxy] section with the relay address is now called [relay]; [proxy] is for a socks5, http or amneziawg proxy, see the example config")
+		}
+		return err
 	}
 	return nil
 }
 
 func LoadServerConfig(path string) (ServerConfig, error) {
 	var f struct {
-		Relay       relayConfigFile `toml:"relay"`
-		Proxy       proxyConfigFile `toml:"proxy"`
+		Relay       RelayConfigFile `toml:"relay"`
+		Proxy       ProxyConfigFile `toml:"proxy"`
 		StreamInput struct {
 			Port uint16 `toml:"port"`
 		} `toml:"stream_input"`
-		Fec     fecConfigFile `toml:"fec"`
+		Fec     FecConfigFile `toml:"fec"`
 		Encoder struct {
 			DispatcherSize    uint64 `toml:"dispatcher_size"`
 			DispatcherTimeout uint64 `toml:"dispatcher_timeout"` // milliseconds
@@ -101,7 +116,7 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 		Pacing struct {
 			RateMbit *uint64 `toml:"rate_mbit"` // nil: not in the file, DefaultPacingRate
 		} `toml:"pacing"`
-		Clock clockConfigFile `toml:"clock"`
+		Clock ClockConfigFile `toml:"clock"`
 	}
 	if err := loadConfigFile(path, &f); err != nil {
 		return ServerConfig{}, err
@@ -123,25 +138,86 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 	}, nil
 }
 
-func LoadClientConfig(path string) (ClientConfig, error) {
-	var f struct {
-		Relay  relayConfigFile `toml:"relay"`
-		Proxy  proxyConfigFile `toml:"proxy"`
-		Player struct {
-			Port uint16 `toml:"port"`
-		} `toml:"player"`
-		Fec     fecConfigFile `toml:"fec"`
-		Decoder struct {
-			AssemblerSize  uint64 `toml:"assembler_size"`
-			DispatcherSize uint64 `toml:"dispatcher_size"`
-		} `toml:"decoder"`
-		Clock clockConfigFile `toml:"clock"`
+// ClientConfigFile is the layout of client.cfg. The Android app edits it
+// field by field and writes it back with Marshal.
+type ClientConfigFile struct {
+	Relay   RelayConfigFile   `toml:"relay"`
+	Proxy   ProxyConfigFile   `toml:"proxy"`
+	Player  PlayerConfigFile  `toml:"player"`
+	Fec     FecConfigFile     `toml:"fec"`
+	Decoder DecoderConfigFile `toml:"decoder"`
+	Clock   ClockConfigFile   `toml:"clock"`
+}
+
+// PlayerConfigFile is the client's [player] section.
+type PlayerConfigFile struct {
+	Port uint16 `toml:"port"` // local UDP port the player reads the mpegts stream from
+}
+
+// DecoderConfigFile is the client's [decoder] section.
+type DecoderConfigFile struct {
+	AssemblerSize  uint64 `toml:"assembler_size"`
+	DispatcherSize uint64 `toml:"dispatcher_size"`
+}
+
+// DefaultClientConfigFile is the client config of cmd/client/client.example.cfg
+// without its relay address, which only the server owner knows.
+func DefaultClientConfigFile() ClientConfigFile {
+	return ClientConfigFile{
+		Relay:   RelayConfigFile{Port: 25565, Network: string(RelayNetworkUDP)},
+		Player:  PlayerConfigFile{Port: 25566},
+		Fec:     FecConfigFile{DataParts: 8, TotalParts: 10},
+		Decoder: DecoderConfigFile{AssemblerSize: 6, DispatcherSize: 12},
 	}
-	if err := loadConfigFile(path, &f); err != nil {
-		return ClientConfig{}, err
+}
+
+// ParseClientConfigFile decodes the text of a client.cfg.
+func ParseClientConfigFile(text []byte) (ClientConfigFile, error) {
+	var f ClientConfigFile
+	if err := decodeConfig(text, &f); err != nil {
+		return ClientConfigFile{}, err
 	}
+	return f, nil
+}
+
+// Marshal returns the text of the client.cfg, the sections in the order of
+// the example config.
+func (f ClientConfigFile) Marshal() ([]byte, error) {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Order(toml.OrderPreserve).Encode(f); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// Validate checks the settings a client would fail on at start, so the
+// Android app can refuse them in its form.
+func (f ClientConfigFile) Validate() error {
+	switch {
+	case f.Relay.Addr == "":
+		return errors.New("the relay address is not set")
+	case f.Relay.Port == 0:
+		return errors.New("the relay port is not set")
+	case f.Player.Port == 0:
+		return errors.New("the player port is not set")
+	case f.Fec.DataParts == 0 || f.Fec.TotalParts <= f.Fec.DataParts:
+		return fmt.Errorf("fec %d of %d: want data parts above zero and fewer than total parts", f.Fec.DataParts, f.Fec.TotalParts)
+	case f.Decoder.AssemblerSize == 0 || f.Decoder.DispatcherSize == 0:
+		return errors.New("the decoder sizes must be above zero")
+	case f.Proxy.Socks5 != nil && f.Proxy.Socks5.URL == "", f.Proxy.HTTP != nil && f.Proxy.HTTP.URL == "":
+		return errors.New("the proxy url is not set")
+	case f.Proxy.AmneziaWG != nil && f.Proxy.AmneziaWG.Config == "":
+		return errors.New("the amneziawg config is not set")
+	}
+	_, err := relayConfig(f.Relay, f.Proxy, "").withDefaults()
+	return err
+}
+
+// Config makes the ClientConfig of the file at configPath; the AmneziaWG
+// config path is relative to its directory.
+func (f ClientConfigFile) Config(configPath string) ClientConfig {
 	return ClientConfig{
-		Relay:      relayConfig(f.Relay, f.Proxy, path),
+		Relay:      relayConfig(f.Relay, f.Proxy, configPath),
 		PlayerPort: f.Player.Port,
 		Fec:        f.Fec.config(),
 		Decoder: DecoderConfig{
@@ -149,5 +225,13 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 			DispatcherSize: f.Decoder.DispatcherSize,
 		},
 		NTPServer: f.Clock.NTPServer,
-	}, nil
+	}
+}
+
+func LoadClientConfig(path string) (ClientConfig, error) {
+	var f ClientConfigFile
+	if err := loadConfigFile(path, &f); err != nil {
+		return ClientConfig{}, err
+	}
+	return f.Config(path), nil
 }

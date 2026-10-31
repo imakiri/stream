@@ -29,6 +29,7 @@ func main() {
 	var keys = flag.String("keys", "", "key directory; the directory of the binary if empty")
 	var sign = flag.String("sign", "", "sign this base64 client public key, print the enrollment and exit")
 	var days = flag.Int("days", 365, "with -sign: days the client certificate is valid")
+	var trace = flag.String("trace", "", "write the latency trace of the stream to this file, for cmd/latency-report; needs [clock] ntp_server")
 	flag.Parse()
 
 	var keyDir = *keys
@@ -69,6 +70,10 @@ func main() {
 	config.Verifier = identity.Verifier()
 	config.OutputReporter = src.NewReporter(output, "out")
 	config.ViewersOutput = output
+	config.TracePath = *trace
+	if *trace != "" && config.NTPServer == "" {
+		log.Printf("the latency trace is stamped by the local clock: set [clock] ntp_server to compare it with the client's")
+	}
 	log.Printf("server %s", config.Credentials.Certificate.ID)
 
 	server, err := src.NewServer(config)

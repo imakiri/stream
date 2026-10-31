@@ -312,6 +312,52 @@ chunks every 5 s, and one line when the data from the server stops or comes
 again: a server without input from OBS answers handshakes but sends no data. The speed of what comes
 from the relay stays on the bottom line of the terminal.
 
+### Android client
+
+`android/` is the client as an Android app (arm64, Android 8+): the Go
+client bound with gomobile (`android/go/streammobile`) plays through libmpv
+(`dev.jdtech.mpv:libmpv`). Screens: the profile (import a `client.cfg` or
+fill it in; an AmneziaWG proxy takes its `.conf` through its own picker),
+enrollment (shows the client key to send for `server -sign`, takes the
+enrollment back), home (play, profile settings, delete the profile) and the
+stream, full screen in landscape; a tap shows the volume and the link state.
+
+The player keeps close to the live edge by itself (`LiveEdge.kt`): it plays
+at 0.9–1.1x speed to hold a margin of stream ahead of playback, and tunes
+that margin at run time, raising it on each audio underrun and lowering it
+while there are none. Other settings found on a phone: AAudio's low-latency
+exclusive output (the default shared one lags ~0.3 s), mpv's UDP fifo far
+above the desktop's (it overran and cut holes in the audio), and a longer
+probe than mpv's low-latency profile, without which MediaCodec gets no
+picture size and does not start.
+
+Build: `android/build-go.sh` (needs gomobile, gobind and the Android NDK)
+makes `app/libs/streammobile.aar`, then `cd android && ./gradlew
+assembleDebug`.
+
+## Measuring the delay, screen to screen
+
+1. Set the same `[clock] ntp_server` on the server and in the app's profile
+   (`time.google.com` agreed with the PC's system clock within 1 ms; keep
+   the PC synced, the marker uses its clock).
+2. Run the server with `-trace trace-server.tsv`.
+3. Open `player/latency-marker.html` in a browser window in the top left
+   quarter of the captured screen. It draws each frame's time as a barcode.
+4. In the app, tap the stream and "Measure latency": the app reads the
+   barcode off its screen 4 times a second and records the client's trace.
+5. Pull the phone's files and make the report:
+
+```
+adb shell run-as one.imakiri.stream cat files/profile/trace-client.tsv > trace-client.tsv
+adb shell run-as one.imakiri.stream cat files/profile/marker.tsv > marker.tsv
+go run ./cmd/latency-report -server trace-server.tsv -client trace-client.tsv -marker marker.tsv
+```
+
+The report times each stage from the frame on the PC's screen to the frame
+on the phone's: the server's (chunking, FEC, interleaving, pacing), the
+network per packet, the client's (FEC, reordering) and the player's buffer;
+screen capture and OBS encoding are what remains of the measured total.
+
 ## Measuring the link
 
 `cmd/stats` sends stream-sized packets through the relay and records their
@@ -343,5 +389,7 @@ relay.
 | `src/keystore.go` | key files and enrollment |
 | `src/config.go` | TOML configs |
 | `cmd/stats` | link delay measurement |
+| `src/latencytrace`, `cmd/latency-report` | stage-by-stage latency trace and its report |
+| `android/` | the Android client |
 | `player/mpv-live-edge.lua` | mpv script that keeps playback at the live edge |
 | `player/play-mpv.sh`, `player/play.sh` (`.bat` on Windows) | start mpv (with the script) or ffplay |

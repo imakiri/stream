@@ -12,6 +12,7 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/imakiri/stream/src/codec"
+	"github.com/imakiri/stream/src/latencytrace"
 	"github.com/imakiri/stream/src/ntpclock"
 	"github.com/imakiri/stream/src/observer"
 	"github.com/imakiri/stream/src/wire"
@@ -68,6 +69,9 @@ type Client struct {
 	// nil before the first.
 	serverClock atomic.Pointer[serverClockSync]
 	e2eDelays   e2eDelays
+	// trace records the stages of the chunks and packets; nil while no
+	// trace runs, see StartTrace.
+	trace atomic.Pointer[latencytrace.Trace]
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -210,6 +214,7 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 			if err != nil {
 				continue // another stream key until the handshake catches up, or forged
 			}
+			c.trace.Load().Packet(latencytrace.ClientReceived, payload)
 			var openedAt = time.Now().UnixNano()
 			c.lastOpenUnixNano.Store(openedAt)
 			c.lastDataUnixNano.Store(openedAt)
@@ -342,5 +347,35 @@ func (c *Client) play(player net.Conn, decoderOut <-chan codec.DecodedChunk) {
 				playerFailing = false
 			}
 		}
+		c.trace.Load().Chunk(latencytrace.ClientOut, chunk.Session, chunk.CSN, time.Time{})
 	}
+}
+
+// StartTrace starts writing the latency trace of the client to path, by the
+// NTP time, replacing a running one; see package latencytrace.
+func (c *Client) StartTrace(path string) error {
+	trace, err := latencytrace.Create(path, func() time.Time {
+		now, _ := c.clock.Now()
+		return now
+	})
+	if err != nil {
+		return err
+	}
+	c.decoder.SetTrace(trace)
+	if previous := c.trace.Swap(trace); previous != nil {
+		_ = previous.Close()
+	}
+	return nil
+}
+
+// StopTrace stops the latency trace and writes it out.
+func (c *Client) StopTrace() error {
+	c.decoder.SetTrace(nil)
+	return c.trace.Swap(nil).Close()
+}
+
+// TrueNow returns the NTP time and whether the clock is synced; before the
+// first sync, or with NTP off, it is the local clock.
+func (c *Client) TrueNow() (time.Time, bool) {
+	return c.clock.Now()
 }

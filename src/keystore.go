@@ -181,38 +181,88 @@ func (id ClientIdentity) Verifier() wire.CertificateVerifier {
 	return wire.RootVerifier{Root: id.Enrollment.RootPublicKey}
 }
 
+// ErrClientNotEnrolled is returned by LoadClientIdentity while the client
+// key has no enrollment yet.
+var ErrClientNotEnrolled = errors.New("the client is not enrolled yet")
+
+// LoadOrCreateClientKey returns the client's public key in base64, the text
+// to send to the server owner, making the key on the first call.
+func LoadOrCreateClientKey(dir string) (publicKeyBase64 string, created bool, err error) {
+	key, err := readPrivateKey(dir, clientKeyFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		if _, key, err = ed25519.GenerateKey(rand.Reader); err != nil {
+			return "", false, err
+		}
+		if err := writeBase64File(dir, clientKeyFile, key); err != nil {
+			return "", false, fmt.Errorf("failed to save %s: %w", clientKeyFile, err)
+		}
+		created = true
+	} else if err != nil {
+		return "", false, err
+	}
+	return wire.EncodeBase64(key.Public().(ed25519.PublicKey)), created, nil
+}
+
+// LoadClientIdentity loads the client key and its enrollment from dir;
+// ErrClientNotEnrolled if there is no enrollment yet.
+func LoadClientIdentity(dir string) (ClientIdentity, error) {
+	key, err := readPrivateKey(dir, clientKeyFile)
+	if err != nil {
+		return ClientIdentity{}, err
+	}
+	raw, err := readBase64File(dir, clientEnrollmentFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return ClientIdentity{}, ErrClientNotEnrolled
+	}
+	if err != nil {
+		return ClientIdentity{}, err
+	}
+	enrollment, err := parseOwnEnrollment(raw, key)
+	if err != nil {
+		return ClientIdentity{}, fmt.Errorf("%s: %w", clientEnrollmentFile, err)
+	}
+	return ClientIdentity{Credentials: wire.Credentials{Certificate: enrollment.Certificate, PrivateKey: key}, Enrollment: enrollment}, nil
+}
+
+// SaveClientEnrollment checks the enrollment the server owner sent back,
+// base64 as server -sign prints it, against the client key in dir and
+// saves it.
+func SaveClientEnrollment(dir, enrollmentBase64 string) (ClientIdentity, error) {
+	key, err := readPrivateKey(dir, clientKeyFile)
+	if err != nil {
+		return ClientIdentity{}, err
+	}
+	raw, err := wire.DecodeBase64(strings.TrimSpace(enrollmentBase64))
+	if err != nil {
+		return ClientIdentity{}, fmt.Errorf("not base64: %w", err)
+	}
+	enrollment, err := parseOwnEnrollment(raw, key)
+	if err != nil {
+		return ClientIdentity{}, fmt.Errorf("not an enrollment of this client: %w", err)
+	}
+	if err := writeBase64File(dir, clientEnrollmentFile, raw); err != nil {
+		return ClientIdentity{}, fmt.Errorf("failed to save %s: %w", clientEnrollmentFile, err)
+	}
+	return ClientIdentity{Credentials: wire.Credentials{Certificate: enrollment.Certificate, PrivateKey: key}, Enrollment: enrollment}, nil
+}
+
 // LoadOrEnrollClientIdentity loads the client credentials from dir. On the
 // first start it makes the client key; until the client is enrolled it prints
 // the public key, copies it to the clipboard and asks for the enrollment the
 // server owner sends back.
 func LoadOrEnrollClientIdentity(dir string, in io.Reader, out io.Writer) (ClientIdentity, error) {
-	key, err := readPrivateKey(dir, clientKeyFile)
-	if errors.Is(err, fs.ErrNotExist) {
-		_, key, err = ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return ClientIdentity{}, err
-		}
-		if err := writeBase64File(dir, clientKeyFile, key); err != nil {
-			return ClientIdentity{}, fmt.Errorf("failed to save %s: %w", clientKeyFile, err)
-		}
+	publicKey, created, err := LoadOrCreateClientKey(dir)
+	if err != nil {
+		return ClientIdentity{}, err
+	}
+	if created {
 		_, _ = fmt.Fprintf(out, "created the client key %s\n", filepath.Join(dir, clientKeyFile))
-	} else if err != nil {
-		return ClientIdentity{}, err
+	}
+	identity, err := LoadClientIdentity(dir)
+	if !errors.Is(err, ErrClientNotEnrolled) {
+		return identity, err
 	}
 
-	raw, err := readBase64File(dir, clientEnrollmentFile)
-	if err == nil {
-		enrollment, err := parseOwnEnrollment(raw, key)
-		if err != nil {
-			return ClientIdentity{}, fmt.Errorf("%s: %w", clientEnrollmentFile, err)
-		}
-		return ClientIdentity{Credentials: wire.Credentials{Certificate: enrollment.Certificate, PrivateKey: key}, Enrollment: enrollment}, nil
-	}
-	if !errors.Is(err, fs.ErrNotExist) {
-		return ClientIdentity{}, err
-	}
-
-	var publicKey = wire.EncodeBase64(key.Public().(ed25519.PublicKey))
 	_, _ = fmt.Fprintf(out, "\nsend this public key to the server owner to sign:\n\n%s\n\n", publicKey)
 	if err := copyToClipboard(publicKey); err != nil {
 		_, _ = fmt.Fprintf(out, "(could not copy it to the clipboard: %s)\n", err)
@@ -233,21 +283,13 @@ func LoadOrEnrollClientIdentity(dir string, in io.Reader, out io.Writer) (Client
 		if text == "" {
 			continue
 		}
-		raw, err := wire.DecodeBase64(text)
+		identity, err := SaveClientEnrollment(dir, text)
 		if err != nil {
-			_, _ = fmt.Fprintf(out, "not base64: %s\n", err)
+			_, _ = fmt.Fprintln(out, err)
 			continue
 		}
-		enrollment, err := parseOwnEnrollment(raw, key)
-		if err != nil {
-			_, _ = fmt.Fprintf(out, "not an enrollment of this client: %s\n", err)
-			continue
-		}
-		if err := writeBase64File(dir, clientEnrollmentFile, raw); err != nil {
-			return ClientIdentity{}, fmt.Errorf("failed to save %s: %w", clientEnrollmentFile, err)
-		}
-		_, _ = fmt.Fprintf(out, "enrolled as %s, valid until %s\n", enrollment.Certificate.ID, enrollment.Certificate.NotAfter.Format(time.DateOnly))
-		return ClientIdentity{Credentials: wire.Credentials{Certificate: enrollment.Certificate, PrivateKey: key}, Enrollment: enrollment}, nil
+		_, _ = fmt.Fprintf(out, "enrolled as %s, valid until %s\n", identity.Credentials.Certificate.ID, identity.Credentials.Certificate.NotAfter.Format(time.DateOnly))
+		return identity, nil
 	}
 }
 

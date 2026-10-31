@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/imakiri/stream/src/codec"
+	"github.com/imakiri/stream/src/latencytrace"
 	"github.com/imakiri/stream/src/liveoutput"
 	"github.com/imakiri/stream/src/ntpclock"
 	"github.com/imakiri/stream/src/observer"
@@ -49,6 +50,9 @@ type ServerConfig struct {
 	// with; the clients measure the end-to-end delay against the same NTP
 	// time. Empty: the local clock.
 	NTPServer string
+	// TracePath, if set, is where the latency trace of the stream goes, see
+	// package latencytrace.
+	TracePath string
 }
 
 // Server takes the stream from OBS, adds FEC, seals it with the stream key
@@ -57,6 +61,7 @@ type ServerConfig struct {
 type Server struct {
 	cfg       ServerConfig
 	clock     *ntpclock.Clock
+	trace     *latencytrace.Trace
 	encoder   *codec.Encoder
 	handshake wire.ServerHandshaker
 	sealer    wire.StreamSealer
@@ -81,9 +86,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		now, _ := clock.Now()
 		return now
 	}
+	var trace *latencytrace.Trace
+	if cfg.TracePath != "" {
+		if trace, err = latencytrace.Create(cfg.TracePath, encoder.InputClock); err != nil {
+			return nil, fmt.Errorf("failed to create the latency trace: %w", err)
+		}
+		encoder.Trace = trace
+	}
 	return &Server{
 		cfg:     cfg,
 		clock:   clock,
+		trace:   trace,
 		encoder: encoder,
 		handshake: &wire.CertificateServerHandshake{
 			Credentials: cfg.Credentials,
@@ -132,7 +145,7 @@ func (s *Server) Run(ctx context.Context) error {
 	go s.watchViewers(ctx)
 
 	<-ctx.Done()
-	return nil
+	return s.trace.Close()
 }
 
 // readStreamInput feeds the datagrams from OBS to the encoder.
@@ -165,6 +178,7 @@ func (s *Server) sendStream(link io.Writer, encoderOut <-chan []byte) {
 		if _, err := link.Write(data); err != nil {
 			return
 		}
+		s.trace.Packet(latencytrace.ServerSent, packet)
 	}
 }
 

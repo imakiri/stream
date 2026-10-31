@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/go-faster/errors"
+	"github.com/imakiri/stream/src/latencytrace"
 	"github.com/klauspost/reedsolomon"
 	"log"
 	"sync"
@@ -13,10 +14,14 @@ import (
 )
 
 type Encoder struct {
-	// InputClock stamps the chunks with the time their first byte arrived,
-	// which the clients compare with their own clock for the end-to-end
-	// delay; time.Now if nil. Set it before Encode.
+	// InputClock is the clock of the encoder's time stamps: each chunk
+	// carries the time its first byte arrived, which the clients compare
+	// with their own clock for the end-to-end delay, and Trace's events.
+	// time.Now if nil. Set it before Encode.
 	InputClock func() time.Time
+	// Trace records when each chunk and packet passes the stages of the
+	// encoder; nil records nothing. Set it before Encode.
+	Trace *latencytrace.Trace
 
 	aggregator struct {
 		mu      *sync.Mutex
@@ -82,10 +87,19 @@ func (encoder *Encoder) OutgoingSize() uint64 {
 	return PacketV2Size
 }
 
-// aggregate is the data of one chunk and when its first byte arrived.
+// aggregate is the data of one chunk, when its first byte arrived and when
+// it was closed.
 type aggregate struct {
 	data      []byte
 	startedAt time.Time
+	closedAt  time.Time
+}
+
+func (encoder *Encoder) now() time.Time {
+	if encoder.InputClock != nil {
+		return encoder.InputClock()
+	}
+	return time.Now()
 }
 
 func (encoder *Encoder) aggregatorFlush(ctx context.Context) {
@@ -98,7 +112,7 @@ func (encoder *Encoder) aggregatorFlush(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
-	case encoder.encodeQueue <- aggregate{data: agData, startedAt: encoder.aggregator.bufStartedAt}:
+	case encoder.encodeQueue <- aggregate{data: agData, startedAt: encoder.aggregator.bufStartedAt, closedAt: encoder.now()}:
 		return
 	}
 }
@@ -131,7 +145,7 @@ func (encoder *Encoder) dispatch(ctx context.Context) {
 					select {
 					case <-ctx.Done():
 						return
-					case encoder.resultQueue <- encoder.dispatcher.buf[i].Marshal():
+					case encoder.resultQueue <- encoder.marshalDispatched(encoder.dispatcher.buf[i]):
 						encoder.dispatcher.buf[i] = nil
 					}
 				}
@@ -171,6 +185,12 @@ encode:
 				fmt.Println(errors.Wrap(err, "encode: rs.Encode"))
 				continue encode
 			}
+			if encoder.Trace != nil {
+				var session, csn = encoder.encoder.session, encoder.encoder.csn
+				encoder.Trace.Chunk(latencytrace.ServerInput, session, csn, input.startedAt)
+				encoder.Trace.Chunk(latencytrace.ServerChunk, session, csn, input.closedAt)
+				encoder.Trace.Chunk(latencytrace.ServerFEC, session, csn, encoder.now())
+			}
 
 			for i := range data {
 				packet, rem = NewPacketV2(KindData, encoder.encoder.csn, uint32(i), encoder.encoder.session, data[i])
@@ -194,10 +214,6 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 	defer close(encoder.encodeQueue)
 	var data []byte
 	var sep int
-	var inputClock = encoder.InputClock
-	if inputClock == nil {
-		inputClock = time.Now
-	}
 	//aggregate:
 	for {
 		select {
@@ -206,7 +222,7 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 		case <-encoder.aggregator.timer.C:
 			encoder.aggregatorFlush(ctx)
 		case data = <-encoder.aggregateQueue:
-			var arrivedAt = inputClock()
+			var arrivedAt = encoder.now()
 			for len(data) > 0 {
 				if len(encoder.aggregator.buf) == 0 {
 					encoder.aggregator.bufStartedAt = arrivedAt
@@ -221,6 +237,12 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 			encoder.aggregator.timer.Reset(encoder.aggregator.timeout)
 		}
 	}
+}
+
+func (encoder *Encoder) marshalDispatched(packet *PacketV2) []byte {
+	var b = packet.Marshal()
+	encoder.Trace.Packet(latencytrace.ServerDispatch, b)
+	return b
 }
 
 // newSession returns a random non-zero session ID.

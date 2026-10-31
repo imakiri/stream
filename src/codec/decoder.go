@@ -3,10 +3,12 @@ package codec
 import (
 	"context"
 	"github.com/go-faster/errors"
+	"github.com/imakiri/stream/src/latencytrace"
 	"github.com/klauspost/reedsolomon"
 	"log"
 	"slices"
 	"sync/atomic"
+	"time"
 )
 
 // assemblyLine collects the packets of one chunk. Lines form a ring indexed by
@@ -28,6 +30,10 @@ func (line *assemblyLine) reuse(csn uint64) {
 }
 
 type Decoder struct {
+	// trace records when each chunk is restored; nil records nothing. It
+	// may be set while the decoder runs, see SetTrace.
+	trace atomic.Pointer[latencytrace.Trace]
+
 	assembler struct {
 		lines []assemblyLine
 		// maxCsn is the newest csn seen in the session; packets older than
@@ -82,16 +88,24 @@ func (decoder *Decoder) Losses() (lost, incomplete uint64) {
 	return decoder.lostChunks.Load(), decoder.incompleteChunks.Load()
 }
 
+// SetTrace starts recording when chunks are restored to trace, or stops with
+// nil.
+func (decoder *Decoder) SetTrace(trace *latencytrace.Trace) {
+	decoder.trace.Store(trace)
+}
+
 // DecodedChunk is the data of one restored chunk, in stream order.
 type DecodedChunk struct {
 	Data []byte
+	// Session and CSN name the chunk, as the latency trace does.
+	Session, CSN uint64
 	// InputUnixMilli is when the chunk reached the encoder, by the sender's
 	// clock; see InputDelay.
 	InputUnixMilli uint32
 }
 
 func decoded(chunk *Chunk) DecodedChunk {
-	return DecodedChunk{Data: chunk.Data(), InputUnixMilli: chunk.inputUnixMilli}
+	return DecodedChunk{Data: chunk.Data(), Session: chunk.session, CSN: chunk.csn, InputUnixMilli: chunk.inputUnixMilli}
 }
 
 func NewDecoder(dataParts, totalParts, assemblerLines, dispatcherSize uint64) (decoder *Decoder, err error) {
@@ -284,6 +298,7 @@ restore:
 				continue restore
 			}
 			chunk.session = session
+			decoder.trace.Load().Chunk(latencytrace.ClientRestored, chunk.session, chunk.csn, time.Time{})
 
 			select {
 			case <-ctx.Done():

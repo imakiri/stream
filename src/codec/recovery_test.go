@@ -41,7 +41,10 @@ func recoveryRun(t *testing.T, ctx context.Context, decoderIn chan<- []byte, dec
 	}()
 	go func() {
 		for range chunks * recoveryTotalParts {
-			var raw = <-encoderOut
+			raw, ok := <-encoderOut
+			if !ok {
+				return // the run ended and stopped the encoder once the decoder had every chunk
+			}
 			var p PacketV2
 			if !p.Unmarshal(raw) {
 				t.Error("encoder produced an invalid packet")
