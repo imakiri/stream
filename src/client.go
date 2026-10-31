@@ -12,6 +12,7 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/imakiri/stream/src/codec"
+	"github.com/imakiri/stream/src/ntpclock"
 	"github.com/imakiri/stream/src/observer"
 	"github.com/imakiri/stream/src/wire"
 )
@@ -27,6 +28,10 @@ type ClientConfig struct {
 	Verifier      wire.CertificateVerifier
 	ServerID      uuid.UUID         // the server's certificate ID; no other certificate may serve the stream
 	InputReporter observer.Reporter // optional: speed of what comes from the relay
+	// NTPServer gives the time the end-to-end delay is measured against,
+	// the one the server stamps the chunks with. Empty, or before the first
+	// answer: the server clock estimated at the handshake.
+	NTPServer string
 }
 
 const (
@@ -45,6 +50,7 @@ const (
 // key, restores the stream with FEC and sends it to the player.
 type Client struct {
 	cfg       ClientConfig
+	clock     *ntpclock.Clock
 	decoder   *codec.Decoder
 	handshake wire.ClientHandshaker
 
@@ -74,6 +80,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	return &Client{
 		cfg:     cfg,
+		clock:   ntpclock.New(cfg.NTPServer),
 		decoder: decoder,
 		handshake: &wire.CertificateClientHandshake{
 			Credentials: cfg.Credentials,
@@ -114,6 +121,7 @@ func (c *Client) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start decoder: %w", err)
 	}
 
+	go c.clock.Run(ctx)
 	go c.keepHandshake(ctx, link)
 	go c.receive(ctx, input, decoderIn)
 	go c.play(player, decoderOut)
@@ -225,26 +233,41 @@ type serverClockSync struct {
 // a round trip before receivedAt. The error is the asymmetry of the path, at
 // most half the round trip. The round trip is taken from the latest client
 // hello, which is right while it is shorter than clientHelloRetryInterval. It
-// returns the estimate for the log.
+// returns the estimate for the log: against the NTP time when the clock is
+// synced, which shows how far the server is off it (the server's own NTP
+// failed or is off), else against this machine's clock.
 func (c *Client) syncServerClock(serverClock, receivedAt time.Time) string {
 	var roundTrip = receivedAt.Sub(time.Unix(0, c.lastHelloSentUnixNano.Load()))
 	var sync = serverClockSync{server: serverClock.Add(roundTrip / 2), local: receivedAt}
 	c.serverClock.Store(&sync)
+	if trueTime, synced := c.clock.At(receivedAt); synced {
+		var ntpError, _ = c.clock.Error()
+		return fmt.Sprintf("server clock minus true time %s ± %s (handshake round trip %s, %s)",
+			sync.server.Sub(trueTime).Round(time.Millisecond), (roundTrip/2 + ntpError).Round(time.Millisecond),
+			roundTrip.Round(time.Millisecond), c.clock)
+	}
 	return fmt.Sprintf("server clock minus this clock %s ± %s (handshake round trip %s)",
 		sync.server.Sub(receivedAt.Round(0)).Round(time.Millisecond), (roundTrip / 2).Round(time.Millisecond), roundTrip.Round(time.Millisecond))
 }
 
-// serverNow returns the current time by the server clock, if it is known.
-// It counts from the last handshake on the monotonic clock, not on this
-// machine's wall clock: a wall clock set after the handshake, as Windows
-// time sync does, would shift every delay by the step, and a step of more
-// than the delay made the delays negative.
+// serverNow returns the current time by the clock the server stamps the
+// chunks with, if it is known. That is the NTP time once the clock is
+// synced, as both ends ask NTP; the handshake estimate is off by the
+// asymmetry of the path, up to half the round trip. Without NTP it is the
+// estimate, counted from the last handshake on the monotonic clock, not on
+// this machine's wall clock: a wall clock set after the handshake, as
+// Windows time sync does, would shift every delay by the step, and a step of
+// more than the delay made the delays negative.
 func (c *Client) serverNow() (time.Time, bool) {
+	var now = time.Now()
+	if trueTime, synced := c.clock.At(now); synced {
+		return trueTime, true
+	}
 	var sync = c.serverClock.Load()
 	if sync == nil {
 		return time.Time{}, false
 	}
-	return sync.server.Add(time.Since(sync.local)), true
+	return sync.server.Add(now.Sub(sync.local)), true
 }
 
 // reportStream logs the end-to-end delay and the lost chunks every

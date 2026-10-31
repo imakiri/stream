@@ -13,6 +13,11 @@ import (
 )
 
 type Encoder struct {
+	// InputClock stamps the chunks with the time their first byte arrived,
+	// which the clients compare with their own clock for the end-to-end
+	// delay; time.Now if nil. Set it before Encode.
+	InputClock func() time.Time
+
 	aggregator struct {
 		mu      *sync.Mutex
 		timeout time.Duration
@@ -189,6 +194,10 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 	defer close(encoder.encodeQueue)
 	var data []byte
 	var sep int
+	var inputClock = encoder.InputClock
+	if inputClock == nil {
+		inputClock = time.Now
+	}
 	//aggregate:
 	for {
 		select {
@@ -197,7 +206,7 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 		case <-encoder.aggregator.timer.C:
 			encoder.aggregatorFlush(ctx)
 		case data = <-encoder.aggregateQueue:
-			var arrivedAt = time.Now()
+			var arrivedAt = inputClock()
 			for len(data) > 0 {
 				if len(encoder.aggregator.buf) == 0 {
 					encoder.aggregator.bufStartedAt = arrivedAt

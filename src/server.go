@@ -11,6 +11,7 @@ import (
 
 	"github.com/imakiri/stream/src/codec"
 	"github.com/imakiri/stream/src/liveoutput"
+	"github.com/imakiri/stream/src/ntpclock"
 	"github.com/imakiri/stream/src/observer"
 	"github.com/imakiri/stream/src/wire"
 )
@@ -44,6 +45,10 @@ type ServerConfig struct {
 	Verifier        wire.CertificateVerifier
 	OutputReporter  observer.Reporter  // optional: speed of what goes to the relay
 	ViewersOutput   *liveoutput.Output // optional: a status line with the clients that watch
+	// NTPServer gives the time the chunks and the server hellos are stamped
+	// with; the clients measure the end-to-end delay against the same NTP
+	// time. Empty: the local clock.
+	NTPServer string
 }
 
 // Server takes the stream from OBS, adds FEC, seals it with the stream key
@@ -51,6 +56,7 @@ type ServerConfig struct {
 // get the stream key from the handshake.
 type Server struct {
 	cfg       ServerConfig
+	clock     *ntpclock.Clock
 	encoder   *codec.Encoder
 	handshake wire.ServerHandshaker
 	sealer    wire.StreamSealer
@@ -70,8 +76,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create stream sealer: %w", err)
 	}
+	var clock = ntpclock.New(cfg.NTPServer)
+	encoder.InputClock = func() time.Time {
+		now, _ := clock.Now()
+		return now
+	}
 	return &Server{
 		cfg:     cfg,
+		clock:   clock,
 		encoder: encoder,
 		handshake: &wire.CertificateServerHandshake{
 			Credentials: cfg.Credentials,
@@ -113,6 +125,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start encoder: %w", err)
 	}
 
+	go s.clock.Run(ctx)
 	go s.readStreamInput(ctx, streamInput, encoderIn)
 	go s.sendStream(output, encoderOut)
 	go s.serveClientPackets(output)
@@ -171,7 +184,8 @@ func (s *Server) serveClientPackets(link io.ReadWriter) {
 		switch wire.PacketKind(buf[:n]) {
 		case wire.KindClientHello:
 			var now = time.Now()
-			serverHello, clientID, reportKey, err := s.handshake.AnswerClientHello(buf[:n], now)
+			var serverClock, _ = s.clock.At(now)
+			serverHello, clientID, reportKey, err := s.handshake.AnswerClientHello(buf[:n], serverClock)
 			if err != nil {
 				log.Printf("rejected client hello: %s", err)
 				continue

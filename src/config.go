@@ -10,7 +10,7 @@ import (
 )
 
 // The config files are TOML; see cmd/server/server.example.cfg and
-// cmd/client/client.example.cfg. They hold the network and FEC settings only:
+// cmd/client/client.example.cfg. They hold the network, FEC and clock settings only:
 // keys and certificates are files in the key directory, see keystore.go.
 
 type relayConfigFile struct {
@@ -63,6 +63,12 @@ func (f fecConfigFile) config() FecConfig {
 	return FecConfig{DataParts: f.DataParts, TotalParts: f.TotalParts}
 }
 
+// clockConfigFile is the [clock] section: the NTP server both ends take the
+// time from for the end-to-end delay.
+type clockConfigFile struct {
+	NTPServer string `toml:"ntp_server"` // empty or not in the file: no NTP
+}
+
 // loadConfigFile decodes the config at path into dst. Unknown keys are an
 // error, so a typo or a section of an older layout is not silently ignored.
 func loadConfigFile(path string, dst any) error {
@@ -95,6 +101,7 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 		Pacing struct {
 			RateMbit *uint64 `toml:"rate_mbit"` // nil: not in the file, DefaultPacingRate
 		} `toml:"pacing"`
+		Clock clockConfigFile `toml:"clock"`
 	}
 	if err := loadConfigFile(path, &f); err != nil {
 		return ServerConfig{}, err
@@ -112,6 +119,7 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 			DispatcherTimeout: time.Duration(f.Encoder.DispatcherTimeout) * time.Millisecond,
 			DispatcherSize:    f.Encoder.DispatcherSize,
 		},
+		NTPServer: f.Clock.NTPServer,
 	}, nil
 }
 
@@ -127,6 +135,7 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 			AssemblerSize  uint64 `toml:"assembler_size"`
 			DispatcherSize uint64 `toml:"dispatcher_size"`
 		} `toml:"decoder"`
+		Clock clockConfigFile `toml:"clock"`
 	}
 	if err := loadConfigFile(path, &f); err != nil {
 		return ClientConfig{}, err
@@ -139,5 +148,6 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 			AssemblerSize:  f.Decoder.AssemblerSize,
 			DispatcherSize: f.Decoder.DispatcherSize,
 		},
+		NTPServer: f.Clock.NTPServer,
 	}, nil
 }

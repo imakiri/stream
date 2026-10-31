@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/amnezia-vpn/amneziawg-go v0.2.19
 	github.com/atotto/clipboard v0.1.4
+	github.com/beevik/ntp v1.4.3
 	github.com/go-faster/errors v0.7.1
 	github.com/gofrs/uuid/v5 v5.3.2
 	github.com/gosuri/uilive v0.0.4

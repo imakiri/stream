@@ -150,6 +150,15 @@ the client, and the chunks lost meanwhile:
 Chunks that came short of packets in groups of neighbours mean burst losses
 on the way; whole chunks missing mean longer breaks.
 
+The handshake estimate is off by the asymmetry of the path, up to half the
+round trip through the relay. For a better delay both ends can take the time
+from the same NTP server: `[clock] ntp_server` in the server and the client
+config (off by default; the example configs list a few servers). Each end
+asks it every 2 minutes, takes the answer with the shortest of 3 round trips
+and counts the time between on the monotonic clock. Then the client's
+handshake line shows the server clock minus the NTP time, which tells whether
+the server is on NTP too.
+
 The client sends the same numbers to the server as a client report, also
 while no data comes. The server logs when a client starts watching
 (`client … watches: e2e delay …`) and when its reports stop for 16 s, shows
@@ -329,6 +338,7 @@ relay.
 | `src/proxy.go`, `src/amneziawg` | the way to the relay through a socks5/http proxy or an AmneziaWG tunnel |
 | `src/wire` | packet kinds, certificates, handshake, data packet sealing |
 | `src/codec` | FEC encoder and decoder |
+| `src/ntpclock` | NTP time for the end-to-end delay |
 | `src/frame` | packet framing over TCP |
 | `src/keystore.go` | key files and enrollment |
 | `src/config.go` | TOML configs |
