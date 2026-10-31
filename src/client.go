@@ -7,15 +7,30 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gofrs/uuid/v5"
 	codec2 "github.com/imakiri/stream/src/codec"
+	"github.com/imakiri/stream/src/frame"
+	"golang.org/x/net/proxy"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
+	"slices"
+	"strconv"
 	"sync"
 	"time"
 )
 
-const udpMax = 1500
+// packetBufferSize fits one packet from OBS or the server (secure.Writer packets are 1084 bytes).
+const packetBufferSize = 1500
+
+// ServerNetwork is the transport between the client and the relay server.
+// The local side towards OBS is always UDP.
+type ServerNetwork string
+
+const (
+	ServerNetworkUDP ServerNetwork = "udp"
+	ServerNetworkTCP ServerNetwork = "tcp"
+)
 
 var UID = uuid.Must(uuid.FromString("1751b2a1-0ffd-44fe-8a2e-d3f153125c43")).Bytes()
 
@@ -27,6 +42,9 @@ type Stat struct {
 
 type Client struct {
 	stats *os.File
+
+	serverNetwork ServerNetwork
+	proxyAddr     *url.URL // TCP only
 
 	portCaller   uint16
 	portListener uint16
@@ -43,7 +61,7 @@ type Client struct {
 	writer io.WriteCloser
 	reader io.ReadCloser
 
-	serverConn   *net.UDPConn
+	serverConn   net.Conn // *frame.Conn after the handshake over TCP
 	callerConn   *net.UDPConn
 	listenerConn *net.UDPConn
 }
@@ -97,59 +115,97 @@ func (client *Client) connect(ctx context.Context, peerID uuid.UUID) error {
 		client.callerConn.SetWriteBuffer(20 * (codec2.PacketV2Size + 12))
 	}
 
-	var dialer = net.Dialer{
-		Timeout:        0,
-		Deadline:       time.Time{},
-		LocalAddr:      nil,
-		FallbackDelay:  0,
-		KeepAlive:      0,
-		Resolver:       nil,
-		Control:        nil,
-		ControlContext: nil,
-	}
-
-	connection, err := dialer.DialContext(ctx, "udp4", fmt.Sprintf("%s:%d", client.serverAddr, client.serverPort))
+	var err error
+	client.serverConn, err = client.dialServer(ctx)
 	if err != nil {
-		return errors.Wrap(err, "connect: dialer.DialContext")
+		return err
 	}
-
-	client.serverConn, ok = connection.(*net.UDPConn)
-	if !ok {
-		return errors.New("connect: connection.(*net.UDPConn) is not ok")
-	}
-
-	client.serverConn.SetReadBuffer(20 * (codec2.PacketV2Size + 12))
+	var serverConn, callerConn, listenerConn = client.serverConn, client.callerConn, client.listenerConn
 	go func() {
 		<-ctx.Done()
-		client.serverConn.Close()
-		client.callerConn.Close()
-		client.listenerConn.Close()
+		serverConn.Close()
+		callerConn.Close()
+		listenerConn.Close()
 	}()
 
-	var handshake = append(UID, peerID.Bytes()...)
-	n, err := connection.Write(handshake)
+	err = client.handshake(peerID)
 	if err != nil {
-		return errors.Wrap(err, "connect: connection.Write")
-	}
-	if n != 32 {
-		return errors.Errorf("connect: connection.Write: written %d bytes", n)
+		return err
 	}
 
-	var buf = make([]byte, udpMax)
-	n, err = connection.Read(buf)
-	if err != nil {
-		return errors.Wrap(err, "connect: connection.Read")
-	}
-	if n < 32 {
-		return errors.Errorf("connect: connection.Read: read %d bytes", n)
+	if client.serverNetwork == ServerNetworkTCP {
+		// TCP is a byte stream: frame the packets so the reader gets them whole.
+		client.serverConn = frame.NewConn(client.serverConn)
 	}
 
-	if !bytes.Equal(buf[:32], handshake) {
-		return errors.Errorf("connect: failed: %s", buf)
-	}
-
-	log.Println("server at", client.serverConn.RemoteAddr().String())
+	log.Printf("server at %s/%s", client.serverNetwork, client.serverConn.RemoteAddr())
 	log.Printf("handshake done")
+	return nil
+}
+
+// dialServer connects to the relay server over the configured network,
+// through the proxy for TCP if one is set.
+func (client *Client) dialServer(ctx context.Context) (net.Conn, error) {
+	var addr = net.JoinHostPort(client.serverAddr, strconv.Itoa(int(client.serverPort)))
+	var dialer = &net.Dialer{}
+
+	switch client.serverNetwork {
+	case ServerNetworkUDP:
+		conn, err := dialer.DialContext(ctx, "udp4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to dial server at udp/%s: %w", addr, err)
+		}
+		_ = conn.(*net.UDPConn).SetReadBuffer(20 * (codec2.PacketV2Size + 12))
+		return conn, nil
+	case ServerNetworkTCP:
+		var contextDialer proxy.ContextDialer = dialer
+		if client.proxyAddr != nil {
+			proxyDialer, err := proxy.FromURL(client.proxyAddr, dialer)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create proxy dialer for %s: %w", client.proxyAddr.Redacted(), err)
+			}
+			var ok bool
+			contextDialer, ok = proxyDialer.(proxy.ContextDialer)
+			if !ok {
+				return nil, fmt.Errorf("proxy dialer for %s does not support context", client.proxyAddr.Redacted())
+			}
+		}
+		conn, err := contextDialer.DialContext(ctx, "tcp4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to dial server at tcp/%s: %w", addr, err)
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetReadBuffer(20 * (codec2.PacketV2Size + 12))
+		}
+		return conn, nil
+	default:
+		return nil, fmt.Errorf("unknown server network %q", client.serverNetwork)
+	}
+}
+
+// handshake sends the hello (UID + peer ID) to the server, unframed on both
+// networks, and waits for the server to echo it back.
+func (client *Client) handshake(peerID uuid.UUID) error {
+	var hello = append(slices.Clone(UID), peerID.Bytes()...)
+	if _, err := client.serverConn.Write(hello); err != nil {
+		return fmt.Errorf("failed to send handshake to server: %w", err)
+	}
+
+	var answer = make([]byte, packetBufferSize)
+	var n int
+	var err error
+	if client.serverNetwork == ServerNetworkTCP {
+		n, err = io.ReadFull(client.serverConn, answer[:len(hello)])
+	} else {
+		n, err = client.serverConn.Read(answer)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read handshake from server at %s: %w", client.serverConn.RemoteAddr(), err)
+	}
+	if !bytes.Equal(answer[:n], hello) {
+		return errors.Errorf("server answered handshake with %d unexpected bytes", n)
+	}
 	return nil
 }
 
@@ -163,7 +219,7 @@ func (client *Client) routeIn(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				buf = make([]byte, udpMax)
+				buf = make([]byte, packetBufferSize)
 				n, err := client.reader.Read(buf)
 				if err != nil {
 					log.Printf("routeIn: reader.Read: %v", err)
@@ -216,7 +272,7 @@ func (client *Client) routeOut(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			default:
-				buf = make([]byte, udpMax)
+				buf = make([]byte, packetBufferSize)
 				n, addr, err = client.listenerConn.ReadFromUDP(buf)
 				if err != nil {
 					log.Printf("routeOut: listenerConn.ReadFromUDP: %v", err)
@@ -234,7 +290,7 @@ func (client *Client) routeOut(ctx context.Context) {
 		}
 	}()
 	go func() {
-		var buf = make([]byte, udpMax)
+		var buf = make([]byte, packetBufferSize)
 		var err error
 		for {
 			select {
@@ -252,8 +308,9 @@ func (client *Client) routeOut(ctx context.Context) {
 }
 
 type Handler interface {
-	Reader(server *net.UDPConn) (io.ReadCloser, error)
-	Writer(server *net.UDPConn) (io.WriteCloser, error)
+	// The server connection carries whole packets: one Read or Write is one packet.
+	Reader(server net.Conn) (io.ReadCloser, error)
+	Writer(server net.Conn) (io.WriteCloser, error)
 }
 
 func (client *Client) Run(ctx context.Context, peerID uuid.UUID, handler Handler) error {
@@ -292,8 +349,10 @@ type Config struct {
 		PortListener uint16
 	}
 	Server struct {
-		Port uint16
-		Addr string
+		Network ServerNetwork // "udp" (default) or "tcp"
+		Proxy   string        // proxy URL, e.g. socks5://127.0.0.1:2080; TCP only
+		Port    uint16
+		Addr    string
 	}
 	Fec struct {
 		DataParts  uint64
@@ -312,6 +371,25 @@ type Config struct {
 func NewClient(cfg *Config) (*Client, error) {
 	var client = new(Client)
 	var err error
+
+	client.serverNetwork = cfg.Server.Network
+	switch client.serverNetwork {
+	case "":
+		client.serverNetwork = ServerNetworkUDP
+	case ServerNetworkUDP, ServerNetworkTCP:
+	default:
+		return nil, fmt.Errorf("unknown server network %q, want %q or %q", cfg.Server.Network, ServerNetworkUDP, ServerNetworkTCP)
+	}
+
+	if cfg.Server.Proxy != "" {
+		if client.serverNetwork != ServerNetworkTCP {
+			return nil, fmt.Errorf("server proxy works only over %q, server network is %q", ServerNetworkTCP, client.serverNetwork)
+		}
+		client.proxyAddr, err = url.Parse(cfg.Server.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse proxy url: %w", err)
+		}
+	}
 	client.encoder, err = codec2.NewEncoder(
 		time.Duration(cfg.Encoder.DispatcherTimeout)*time.Millisecond,
 		cfg.Encoder.DispatcherSize,

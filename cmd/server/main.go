@@ -1,245 +1,336 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"github.com/go-faster/errors"
 	"github.com/gofrs/uuid/v5"
 	"github.com/gosuri/uilive"
 	"github.com/imakiri/stream/src"
+	"github.com/imakiri/stream/src/frame"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// handshakeSize is the size of the hello a client sends first and the server
+// echoes back: 16 bytes of src.UID followed by the 16-byte peer ID.
+const handshakeSize = 32
+
+// packetBufferSize fits any UDP datagram and any frame.
+const packetBufferSize = 1<<16 - 1
+
+const tcpWriteTimeout = time.Second
+
+// Peer is one connected client. A peer is reached either over UDP, by the
+// address its handshake came from, or over TCP, through its framed connection.
 type Peer struct {
-	id   uuid.UUID
-	addr *net.UDPAddr
+	id      uuid.UUID
+	addr    net.Addr
+	udpAddr *net.UDPAddr // set for UDP peers
+	tcpConn *frame.Conn  // set for TCP peers
 }
 
+func (p *Peer) network() string {
+	if p.tcpConn != nil {
+		return "tcp"
+	}
+	return "udp"
+}
+
+func (p *Peer) close() {
+	if p.tcpConn != nil {
+		_ = p.tcpConn.Close()
+	}
+}
+
+// Server relays every packet from a peer to all other peers, whichever
+// transport each of them used to connect: it listens on UDP and TCP at the
+// same address.
 type Server struct {
-	addr string
+	mu     sync.RWMutex
+	peers  []*Peer
+	closed bool // set by Close under mu, so no peer is added after Close took its snapshot
 
-	peers  [2]Peer
-	server *net.UDPConn
+	done        chan struct{}
+	wg          sync.WaitGroup
+	udpConn     *net.UDPConn
+	tcpListener net.Listener
 
+	addr                string
 	logger              *uilive.Writer
 	totalReceivedBefore uint64
-	totalReceived       *uint64
 	totalSentBefore     uint64
-	totalSent           *uint64
+	totalReceived       atomic.Uint64
+	totalSent           atomic.Uint64
 }
 
 func NewServer(addr string, logger *uilive.Writer) *Server {
-	var server = new(Server)
-	server.logger = logger
-	server.addr = addr
-	return server
+	return &Server{addr: addr, logger: logger}
 }
 
-func (s *Server) waitForSenderAddr(ctx context.Context, senderConn *net.UDPConn) *net.UDPAddr {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			hello := make([]byte, 20)
-			_, senderAddr, err := senderConn.ReadFromUDP(hello)
-			if err != nil {
-				log.Println(errors.Wrap(err, "conn.ReadFromUDP"))
-				continue
-			}
-			if string(hello) == "hello from sender---" {
-				log.Println("sender addr", senderAddr.String())
-				return senderAddr
-			}
-			//log.Println("unknown hello", string(hello))
+// addPeer registers the peer, replacing a previous connection with the same ID.
+// It returns false, and closes the peer, if the server is closing.
+func (s *Server) addPeer(peer *Peer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		peer.close()
+		return false
+	}
+	for i := range s.peers {
+		if s.peers[i].id == peer.id {
+			s.peers[i].close()
+			s.peers[i] = peer
+			log.Printf("updated peer: id %s at %s/%s", peer.id, peer.network(), peer.addr)
+			return true
 		}
 	}
+	s.peers = append(s.peers, peer)
+	log.Printf("added peer: id %s at %s/%s", peer.id, peer.network(), peer.addr)
+	return true
 }
 
-func (s *Server) waitForReceiverAddr(ctx context.Context, receiverConn *net.UDPConn) *net.UDPAddr {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-			hello := make([]byte, 20)
-			_, receiverAddr, err := receiverConn.ReadFromUDP(hello)
-			if err != nil {
-				log.Println(errors.Wrap(err, "conn.ReadFromUDP"))
-				continue
-			}
-			if string(hello) == "hello from receiver-" {
-				log.Println("receiver addr", receiverAddr.String())
-				return receiverAddr
-			}
-			//log.Println("unknown hello", string(hello))
+// removePeer removes this very peer; it does nothing if the peer has already
+// been replaced by a newer connection with the same ID.
+func (s *Server) removePeer(peer *Peer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var i = slices.Index(s.peers, peer)
+	if i < 0 {
+		return
+	}
+	peer.close()
+	s.peers = slices.Delete(s.peers, i, i+1)
+	log.Printf("removed peer: id %s at %s/%s", peer.id, peer.network(), peer.addr)
+}
+
+func (s *Server) appendPeers(dst []*Peer) []*Peer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append(dst, s.peers...)
+}
+
+func (s *Server) findUDPPeer(addr *net.UDPAddr) *Peer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var addrPort = addr.AddrPort()
+	for _, peer := range s.peers {
+		if peer.udpAddr != nil && peer.udpAddr.AddrPort() == addrPort {
+			return peer
 		}
 	}
+	return nil
 }
 
-func (s *Server) setRoute(peerID uuid.UUID, addr *net.UDPAddr) {
-	switch {
-	case s.peers[0].id == peerID:
-		log.Printf("set new addr %s for peer %s", addr.AddrPort(), peerID)
-		s.peers[0].addr = addr
-	case s.peers[1].id == peerID:
-		log.Printf("set new addr %s for peer %s", addr.AddrPort(), peerID)
-		s.peers[1].addr = addr
-	case s.peers[0].id == uuid.Nil:
-		log.Printf("set new peet: id %s addr %s", peerID, addr.AddrPort())
-		s.peers[0].addr = addr
-		s.peers[0].id = peerID
-	case s.peers[1].id == uuid.Nil:
-		log.Printf("set new peet: id %s addr %s", peerID, addr.AddrPort())
-		s.peers[1].addr = addr
-		s.peers[1].id = peerID
-	default:
-		log.Println("no more room for new peers")
-	}
-}
-
-func (s *Server) checkHandshake(buf []byte) uuid.UUID {
-	if len(buf) < 32 {
+// parseHandshake returns the peer ID from a client hello, or uuid.Nil if
+// hello is not one.
+func parseHandshake(hello []byte) uuid.UUID {
+	if len(hello) != handshakeSize || string(hello[:16]) != string(src.UID) {
 		return uuid.Nil
 	}
+	return uuid.FromBytesOrNil(hello[16:])
+}
 
-	for i := 0; i < 16; i++ {
-		if buf[i] != src.UID[i] {
-			return uuid.Nil
+func (s *Server) sendToPeer(peer *Peer, packet []byte) error {
+	if peer.tcpConn != nil {
+		_ = peer.tcpConn.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
+		_, err := peer.tcpConn.Write(packet)
+		return err
+	}
+	n, err := s.udpConn.WriteToUDP(packet, peer.udpAddr)
+	if err == nil && n != len(packet) {
+		err = fmt.Errorf("written %d of %d bytes", n, len(packet))
+	}
+	return err
+}
+
+// relay sends the packet to every peer except the sender. A TCP peer that
+// fails to take it is dropped; UDP has no connection to drop.
+func (s *Server) relay(from *Peer, packet []byte, peers []*Peer) []*Peer {
+	s.totalReceived.Add(uint64(len(packet)))
+	peers = s.appendPeers(peers[:0])
+	for _, peer := range peers {
+		if peer.id == from.id {
+			continue
 		}
+		if err := s.sendToPeer(peer, packet); err != nil {
+			log.Printf("failed to send to peer %s at %s/%s: %s", peer.id, peer.network(), peer.addr, err)
+			if peer.tcpConn != nil {
+				s.removePeer(peer)
+			}
+			continue
+		}
+		s.totalSent.Add(uint64(len(packet)))
 	}
-
-	return uuid.FromBytesOrNil(buf[16:32])
+	return peers
 }
 
-func (s *Server) route(addr *net.UDPAddr) *net.UDPAddr {
-	if s.peers[0].addr.AddrPort().String() == addr.AddrPort().String() {
-		return s.peers[1].addr
+func (s *Server) serveUDP() {
+	var buf = make([]byte, packetBufferSize)
+	var peers []*Peer
+	for {
+		n, addr, err := s.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("failed to read udp: %s", err)
+			continue
+		}
+
+		if peerID := parseHandshake(buf[:n]); peerID != uuid.Nil {
+			if !s.addPeer(&Peer{id: peerID, addr: addr, udpAddr: addr}) {
+				return
+			}
+			if _, err := s.udpConn.WriteToUDP(buf[:n], addr); err != nil {
+				log.Printf("failed to answer udp handshake from %s: %s", addr, err)
+			}
+			continue
+		}
+
+		var from = s.findUDPPeer(addr)
+		if from == nil {
+			log.Printf("dropped udp packet from unknown peer at %s", addr)
+			continue
+		}
+		peers = s.relay(from, buf[:n], peers)
 	}
-	if s.peers[1].addr.AddrPort().String() == addr.AddrPort().String() {
-		return s.peers[0].addr
-	}
-	return nil
 }
 
-func (s *Server) serve(ctx context.Context) {
-	var buf = make([]byte, udpMax)
-serve:
+func (s *Server) serveTCP() {
+	for {
+		conn, err := s.tcpListener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("failed to accept tcp connection: %s", err)
+			continue
+		}
+		s.wg.Go(func() { s.serveTCPConn(conn) })
+	}
+}
+
+func (s *Server) serveTCPConn(conn net.Conn) {
+	var addr = conn.RemoteAddr()
+	var hello = make([]byte, handshakeSize)
+
+	_ = conn.SetDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(conn, hello); err != nil {
+		_ = conn.Close()
+		log.Printf("failed tcp handshake from %s: %s", addr, err)
+		return
+	}
+	var peerID = parseHandshake(hello)
+	if peerID == uuid.Nil {
+		_ = conn.Close()
+		log.Printf("failed tcp handshake from %s: bad hello", addr)
+		return
+	}
+	if _, err := conn.Write(hello); err != nil {
+		_ = conn.Close()
+		log.Printf("failed tcp handshake from %s: %s", addr, err)
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+
+	var peer = &Peer{id: peerID, addr: addr, tcpConn: frame.NewConn(conn)}
+	if !s.addPeer(peer) {
+		return
+	}
+
+	var buf = make([]byte, packetBufferSize)
+	var peers []*Peer
+	for {
+		n, err := peer.tcpConn.Read(buf)
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				log.Printf("failed to read from peer %s at tcp/%s: %s", peer.id, addr, err)
+			}
+			s.removePeer(peer)
+			return
+		}
+		peers = s.relay(peer, buf[:n], peers)
+	}
+}
+
+func (s *Server) reportSpeed() {
+	var ticker = time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-s.done:
 			return
-		default:
-			n, addr, err := s.server.ReadFromUDP(buf)
-			if err != nil {
-				log.Println(errors.Wrap(err, "serve: s.server.ReadFrom"))
-				continue serve
-			}
-			atomic.AddUint64(s.totalReceived, uint64(n))
+		case <-ticker.C:
+			var totalReceived = s.totalReceived.Load()
+			var totalSent = s.totalSent.Load()
 
-			var peerID = s.checkHandshake(buf[:n])
-			if peerID != uuid.Nil {
-				log.Printf("incomming handshake from %s", addr.AddrPort().String())
-				s.setRoute(peerID, addr)
-
-				m, err := s.server.WriteToUDP(buf[:n], addr)
-				if err != nil {
-					log.Println(errors.Wrap(err, "serve: handshake s.server.WriteToUDP"))
-					continue serve
-				}
-				if m < 32 {
-					log.Println(errors.Wrap(err, "serve: handshake ack failed"))
-					continue serve
-				}
-
-				log.Println("handshake done")
-				continue serve
+			if totalReceived > s.totalReceivedBefore {
+				_, _ = fmt.Fprintf(s.logger.Newline(), "incoming speed: %6d KBit/sec, outgoing speed: %6d KBit/sec, transmited: %6d MB\n",
+					8*(totalReceived-s.totalReceivedBefore)/(1<<10), 8*(totalSent-s.totalSentBefore)/(1<<10), totalReceived/(1<<20))
 			}
 
-			var toAddr = s.route(addr)
-			if toAddr == nil {
-				log.Println(errors.Wrap(err, "serve: missing second peer"))
-				continue serve
-			}
-
-			m, err := s.server.WriteToUDP(buf[:n], toAddr)
-			if err != nil {
-				log.Println(errors.Wrap(err, "serve: s.server.WriteToUDP"))
-				continue serve
-			}
-			if n != m {
-				log.Printf("routeOut: read %d written %d", n, m)
-				continue serve
-			}
-			atomic.AddUint64(s.totalSent, uint64(n))
-			continue serve
+			s.totalReceivedBefore = totalReceived
+			s.totalSentBefore = totalSent
 		}
 	}
 }
 
-func (s *Server) Serve(ctx context.Context) error {
-	s.totalReceived = new(uint64)
-	s.totalSent = new(uint64)
-
-	var config = net.ListenConfig{
-		Control:   nil,
-		KeepAlive: 0,
+// Serve starts listening on UDP and TCP at the server address.
+func (s *Server) Serve() error {
+	if s.done != nil {
+		return errors.New("server can be started only once")
 	}
 
-	fmt.Println("starting server at:", s.addr)
-	var server, err = config.ListenPacket(ctx, "udp4", s.addr)
+	udpAddr, err := net.ResolveUDPAddr("udp4", s.addr)
 	if err != nil {
-		return errors.Wrap(err, "config.ListenPacket")
+		return fmt.Errorf("failed to resolve udp address %s: %w", s.addr, err)
 	}
-
-	var ok bool
-	s.server, ok = server.(*net.UDPConn)
-	if !ok {
-		return errors.New("server.(*net.UDPConn): not ok")
+	udpConn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen udp at %s: %w", s.addr, err)
 	}
-	go func() {
-		<-ctx.Done()
-		s.server.Close()
-	}()
+	tcpListener, err := net.Listen("tcp4", s.addr)
+	if err != nil {
+		_ = udpConn.Close()
+		return fmt.Errorf("failed to listen tcp at %s: %w", s.addr, err)
+	}
+	log.Printf("listening at udp/%s and tcp/%s", udpConn.LocalAddr(), tcpListener.Addr())
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				var totalReceived = atomic.LoadUint64(s.totalReceived)
-				var totalSent = atomic.LoadUint64(s.totalSent)
+	s.done = make(chan struct{})
+	s.udpConn = udpConn
+	s.tcpListener = tcpListener
 
-				if int64(totalReceived)-int64(s.totalReceivedBefore) > 0 {
-					_, _ = fmt.Fprintf(s.logger.Newline(), "incoming speed: %6d KBit/sec, outgoing speed: %6d KBit/sec, transmited: %6d MB\n",
-						8*(totalReceived-s.totalReceivedBefore)/(1<<10), 8*(totalSent-s.totalSentBefore)/(1<<10), totalReceived/(1<<20))
-				} else if totalReceived-s.totalReceivedBefore == 0 {
-				} else {
-					log.Printf("transmited: %d MBit\n", 8*(s.totalReceivedBefore-totalReceived)/(1<<20))
-				}
-
-				s.totalReceivedBefore = totalReceived
-				s.totalSentBefore = totalSent
-				time.Sleep(time.Second)
-			}
-		}
-	}()
-
-	go s.serve(ctx)
+	s.wg.Go(s.reportSpeed)
+	s.wg.Go(s.serveUDP)
+	s.wg.Go(s.serveTCP)
 	return nil
 }
 
-const udpMax = 1<<16 - 1
+func (s *Server) Close() {
+	close(s.done)
+	_ = s.udpConn.Close()
+	_ = s.tcpListener.Close()
+
+	s.mu.Lock()
+	s.closed = true
+	var peers = slices.Clone(s.peers)
+	s.mu.Unlock()
+	for _, peer := range peers {
+		s.removePeer(peer)
+	}
+	s.wg.Wait()
+}
 
 func main() {
-	var addr = flag.String("addr", "127.0.0.1:25565", "address of a server")
+	var addr = flag.String("addr", "127.0.0.1:25565", "address to listen at, over both udp and tcp")
 	flag.Parse()
 
 	var logger = uilive.New()
@@ -248,15 +339,13 @@ func main() {
 	log.SetOutput(logger.Bypass())
 
 	var server = NewServer(*addr, logger)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
-	defer cancel()
-
-	var err = server.Serve(ctx)
-	if err != nil {
+	if err := server.Serve(); err != nil {
 		log.Fatalln(err)
 	}
 
-	<-ctx.Done()
+	var stop = make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	<-stop
+	server.Close()
 	logger.Stop()
 }

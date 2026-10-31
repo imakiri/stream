@@ -65,7 +65,7 @@ func NewHandler(output *uilive.Writer, secret []byte) (*Handler, error) {
 	return h, nil
 }
 
-func (h *Handler) Reader(server *net.UDPConn) (reader io.ReadCloser, err error) {
+func (h *Handler) Reader(server net.Conn) (reader io.ReadCloser, err error) {
 	reporter, err := src.NewReporter(h.readerOutput, "in ")
 	if err != nil {
 		return nil, errors.Wrap(err, "fec.NewReporter")
@@ -88,7 +88,7 @@ func (h *Handler) Reader(server *net.UDPConn) (reader io.ReadCloser, err error) 
 	return reader, nil
 }
 
-func (h *Handler) Writer(server *net.UDPConn) (writer io.WriteCloser, err error) {
+func (h *Handler) Writer(server net.Conn) (writer io.WriteCloser, err error) {
 	reporter, err := src.NewReporter(h.writerOutput, "out")
 	if err != nil {
 		return nil, errors.Wrap(err, "fec.NewReporter")
@@ -177,8 +177,10 @@ func NewConfig(path string) (*Config, error) {
 			TotalParts uint64 `toml:"total_parts"`
 		} `toml:"fec"`
 		Server struct {
-			Port uint16 `toml:"port"`
-			Addr string `toml:"addr"`
+			Network string `toml:"network"` // "udp" (default) or "tcp"
+			Proxy   string `toml:"proxy"`   // tcp only, e.g. socks5://127.0.0.1:2080
+			Port    uint16 `toml:"port"`
+			Addr    string `toml:"addr"`
 		} `toml:"server"`
 		Security struct {
 			PrivateKey string `toml:"private_key"`
@@ -203,6 +205,8 @@ func NewConfig(path string) (*Config, error) {
 	config.ClientConfig = new(src.Config)
 	config.ClientConfig.Peer.PortCaller = cfg.Peer.PortCaller
 	config.ClientConfig.Peer.PortListener = cfg.Peer.PortListener
+	config.ClientConfig.Server.Network = src.ServerNetwork(cfg.Server.Network)
+	config.ClientConfig.Server.Proxy = cfg.Server.Proxy
 	config.ClientConfig.Server.Port = cfg.Server.Port
 	config.ClientConfig.Server.Addr = cfg.Server.Addr
 	config.ClientConfig.Fec.TotalParts = cfg.Fec.TotalParts
