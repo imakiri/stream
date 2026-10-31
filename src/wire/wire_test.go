@@ -101,7 +101,7 @@ func TestHandshakeDeliversStreamKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverHello, clientID, err := pair.server.AnswerClientHello(clientHello, now)
+	serverHello, clientID, _, err := pair.server.AnswerClientHello(clientHello, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,10 +111,11 @@ func TestHandshakeDeliversStreamKey(t *testing.T) {
 	if routed, _ := ServerHelloClientID(serverHello); routed != clientCreds.Certificate.ID {
 		t.Fatalf("server hello routed to %s", routed)
 	}
-	opener, serverClock, err := pair.client.FinishServerHello(serverHello, now)
+	session, serverClock, err := pair.client.FinishServerHello(serverHello, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var opener = session.Stream
 	if !serverClock.Equal(time.UnixMilli(now.UnixMilli())) {
 		t.Fatalf("server clock %s, want %s", serverClock, now)
 	}
@@ -145,7 +146,7 @@ func TestHandshakeRejects(t *testing.T) {
 	t.Run("client with an expired certificate", func(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, pki.issue(t, now.Add(-time.Hour)))
 		hello, _ := pair.client.NewClientHello()
-		if _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrCertificateExpired) {
+		if _, _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrCertificateExpired) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -153,7 +154,7 @@ func TestHandshakeRejects(t *testing.T) {
 	t.Run("client from another root", func(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, newTestPKI(t).issue(t, nextYear))
 		hello, _ := pair.client.NewClientHello()
-		if _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrCertificateNotTrusted) {
+		if _, _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrCertificateNotTrusted) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -162,7 +163,7 @@ func TestHandshakeRejects(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, clientCreds)
 		hello, _ := pair.client.NewClientHello()
 		hello[2+CertificateSize] ^= 1
-		if _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrInvalidHandshake) {
+		if _, _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrInvalidHandshake) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -172,7 +173,7 @@ func TestHandshakeRejects(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, clientCreds)
 		var fake = newHandshakePair(t, pki, impostor, clientCreds)
 		hello, _ := pair.client.NewClientHello()
-		serverHello, _, err := fake.server.AnswerClientHello(hello, now)
+		serverHello, _, _, err := fake.server.AnswerClientHello(hello, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -184,7 +185,7 @@ func TestHandshakeRejects(t *testing.T) {
 	t.Run("server hello of an older attempt", func(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, clientCreds)
 		oldHello, _ := pair.client.NewClientHello()
-		oldServerHello, _, err := pair.server.AnswerClientHello(oldHello, now)
+		oldServerHello, _, _, err := pair.server.AnswerClientHello(oldHello, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -199,11 +200,12 @@ func TestHandshakeRejects(t *testing.T) {
 	t.Run("data of another stream key", func(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, clientCreds)
 		hello, _ := pair.client.NewClientHello()
-		serverHello, _, _ := pair.server.AnswerClientHello(hello, now)
-		opener, _, err := pair.client.FinishServerHello(serverHello, now)
+		serverHello, _, _, _ := pair.server.AnswerClientHello(hello, now)
+		session, _, err := pair.client.FinishServerHello(serverHello, now)
 		if err != nil {
 			t.Fatal(err)
 		}
+		var opener = session.Stream
 		otherKey, _ := NewStreamKey()
 		sealer, _ := NewStreamSealer(otherKey)
 		if _, err := opener.OpenData(sealer.SealData([]byte("x"))); !errors.Is(err, ErrUnknownEpoch) {

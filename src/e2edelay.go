@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/imakiri/stream/src/wire"
 )
 
 // e2eDelayReportInterval is how often a client logs the end-to-end delay of
@@ -36,18 +38,30 @@ func (d *e2eDelays) take() []time.Duration {
 	return samples
 }
 
-// formatStreamReport describes the sorted delay samples of the played
-// chunks, which must not be empty, and the chunks lost in the same time (see
+// newClientReport summarizes the sorted delay samples of the chunks played
+// in one report interval and the chunks lost in the same time (see
 // codec.Decoder.Losses).
-func formatStreamReport(samples []time.Duration, lost, incomplete uint64) string {
-	var percentile = func(p int) time.Duration {
-		return samples[min(len(samples)-1, len(samples)*p/100)]
+func newClientReport(samples []time.Duration, lost, incomplete uint64) wire.ClientReport {
+	var report = wire.ClientReport{Chunks: uint32(len(samples)), Lost: uint32(lost), Incomplete: uint32(incomplete)}
+	if len(samples) > 0 {
+		var percentile = func(p int) time.Duration {
+			return samples[min(len(samples)-1, len(samples)*p/100)]
+		}
+		report.DelayP50, report.DelayP99, report.DelayMax = percentile(50), percentile(99), samples[len(samples)-1]
+	}
+	return report
+}
+
+// formatStreamReport describes a client report; the client logs it, and the
+// server logs the reports of its clients.
+func formatStreamReport(r wire.ClientReport) string {
+	if r.Chunks == 0 && r.Lost == 0 {
+		return "no stream data"
 	}
 	var report = fmt.Sprintf("e2e delay p50 %s, p99 %s, max %s over %d chunks, lost %d",
-		percentile(50).Round(time.Millisecond), percentile(99).Round(time.Millisecond),
-		samples[len(samples)-1].Round(time.Millisecond), len(samples), lost)
-	if incomplete > 0 {
-		report += fmt.Sprintf(" (%d came short of packets)", incomplete)
+		r.DelayP50.Round(time.Millisecond), r.DelayP99.Round(time.Millisecond), r.DelayMax.Round(time.Millisecond), r.Chunks, r.Lost)
+	if r.Incomplete > 0 {
+		report += fmt.Sprintf(" (%d came short of packets)", r.Incomplete)
 	}
 	return report
 }

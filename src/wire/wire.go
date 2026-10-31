@@ -11,6 +11,8 @@
 //	                stream key wrapped for that client
 //	KindData        server -> relay -> all clients: one FEC packet of the
 //	                stream, sealed with the stream key, see stream.go
+//	KindClientReport client -> relay -> server: the delay and losses the
+//	                client sees, sealed with its own report key, see report.go
 //
 // The relay reads only the version, the kind and the clear routing fields;
 // everything it relays between server and clients is end-to-end protected.
@@ -34,10 +36,11 @@ const Version = 3
 type Kind uint8
 
 const (
-	KindRelayHello  Kind = 1
-	KindClientHello Kind = 2
-	KindServerHello Kind = 3
-	KindData        Kind = 4
+	KindRelayHello   Kind = 1
+	KindClientHello  Kind = 2
+	KindServerHello  Kind = 3
+	KindData         Kind = 4
+	KindClientReport Kind = 5
 )
 
 // PacketKind returns the kind of a packet, or 0 if it is not a packet of

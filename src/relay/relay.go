@@ -71,9 +71,10 @@ func (p *Peer) close() {
 // Relay routes packets between one server and its clients over UDP and TCP
 // at the same address, whichever transport each peer connected with:
 //
-//	client hello  client -> the server
-//	server hello  server -> the client it names
-//	data          server -> every client
+//	client hello   client -> the server
+//	server hello   server -> the client it names
+//	data           server -> every client
+//	client report  client -> the server, only with the sender's own client ID
 //
 // Anything else, and data from clients, is dropped.
 type Relay struct {
@@ -213,6 +214,18 @@ func (p *Relay) route(from *Peer, packet []byte, peers []*Peer) []*Peer {
 		}
 		if client := p.findPeer(func(peer *Peer) bool { return peer.role == wire.RoleClient && peer.id == clientID }); client != nil {
 			p.send(client, packet)
+		}
+	case wire.KindClientReport:
+		// only a client's own reports: the clear client ID must be the
+		// sender's, so one client cannot fill the server's log for another
+		if from.role != wire.RoleClient {
+			break
+		}
+		if clientID, ok := wire.ClientReportClientID(packet); !ok || clientID != from.id {
+			break
+		}
+		if server := p.findPeer(func(peer *Peer) bool { return peer.role == wire.RoleServer }); server != nil {
+			p.send(server, packet)
 		}
 	case wire.KindData:
 		if from.role != wire.RoleServer {

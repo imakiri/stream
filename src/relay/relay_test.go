@@ -169,6 +169,20 @@ func TestRelayRoutesBetweenServerAndClients(t *testing.T) {
 	}
 	expectNothing(t, tcpClient, "client data at another client")
 	expectNothing(t, server, "client data at server")
+
+	// a client report goes to the server only
+	var report = clientReportFrom(udpClientID)
+	if _, err := udpClient.Write(report); err != nil {
+		t.Fatal(err)
+	}
+	expectPacket(t, server, report, "client report at server")
+	expectNothing(t, tcpClient, "client report at another client")
+}
+
+func clientReportFrom(clientID uuid.UUID) []byte {
+	var b = packetOfKind(wire.KindClientReport, wire.ClientReportSize, 7)
+	copy(b[2:18], clientID.Bytes())
+	return b
 }
 
 // TestRelayFollowsUDPPeerToNewPort repeats a client's relay hello from another

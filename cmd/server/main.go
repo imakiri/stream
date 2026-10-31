@@ -68,6 +68,7 @@ func main() {
 	config.Credentials = identity.Credentials
 	config.Verifier = identity.Verifier()
 	config.OutputReporter = src.NewReporter(output, "out")
+	config.ViewersOutput = output
 	log.Printf("server %s", config.Credentials.Certificate.ID)
 
 	server, err := src.NewServer(config)

@@ -78,7 +78,7 @@ func TestEnrollmentFromFirstStartToConnect(t *testing.T) {
 	var serverHandshake = &wire.CertificateServerHandshake{Credentials: server.Credentials, Verifier: server.Verifier(), StreamKey: streamKey}
 	var clientHandshake = &wire.CertificateClientHandshake{Credentials: client.Credentials, Verifier: client.Verifier(), ServerID: client.Enrollment.ServerID}
 	hello, _ := clientHandshake.NewClientHello()
-	serverHello, _, err := serverHandshake.AnswerClientHello(hello, time.Now())
+	serverHello, _, _, err := serverHandshake.AnswerClientHello(hello, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

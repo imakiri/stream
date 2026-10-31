@@ -29,6 +29,28 @@ func TestRelayDropsHellosFromTheWrongRole(t *testing.T) {
 	expectNothing(t, victim, "a server's client hello at a client")
 }
 
+// TestRelayDropsForeignClientReports checks that a client cannot send
+// reports in another client's name, and that the server cannot send reports
+// at all.
+func TestRelayDropsForeignClientReports(t *testing.T) {
+	var p, addr = startRelay(t)
+	var victimID = uuid.Must(uuid.NewV4())
+	var server = connectTCP(t, addr, wire.RoleServer, uuid.Must(uuid.NewV4()))
+	var attacker = connectUDP(t, addr, wire.RoleClient, uuid.Must(uuid.NewV4()))
+	var victim = connectUDP(t, addr, wire.RoleClient, victimID)
+	waitPeers(t, p, 3)
+
+	if _, err := attacker.Write(clientReportFrom(victimID)); err != nil {
+		t.Fatal(err)
+	}
+	expectNothing(t, server, "a report in another client's name at the server")
+
+	if _, err := server.Write(clientReportFrom(victimID)); err != nil {
+		t.Fatal(err)
+	}
+	expectNothing(t, victim, "a server's report at a client")
+}
+
 // TestRelaySurvivesGarbage throws random datagrams and frames of every size
 // at the relay, over UDP and TCP, and checks it still routes the stream.
 func TestRelaySurvivesGarbage(t *testing.T) {

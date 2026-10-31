@@ -138,7 +138,7 @@ func TestClientHelloRejectsAnyChangedByte(t *testing.T) {
 	for i := range hello {
 		var changed = bytes.Clone(hello)
 		changed[i] ^= 0x01
-		if _, _, err := pair.server.AnswerClientHello(changed, now); err == nil {
+		if _, _, _, err := pair.server.AnswerClientHello(changed, now); err == nil {
 			t.Fatalf("client hello with byte %d changed was answered", i)
 		}
 	}
@@ -153,7 +153,7 @@ func TestServerHelloRejectsAnyChangedByte(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverHello, _, err := pair.server.AnswerClientHello(hello, now)
+	serverHello, _, _, err := pair.server.AnswerClientHello(hello, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestHandshakeRejectsStolenCertificate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrInvalidHandshake) {
+		if _, _, _, err := pair.server.AnswerClientHello(hello, now); !errors.Is(err, ErrInvalidHandshake) {
 			t.Fatalf("got %v, want ErrInvalidHandshake", err)
 		}
 	})
@@ -199,7 +199,7 @@ func TestHandshakeRejectsStolenCertificate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		serverHello, _, err := impostor.server.AnswerClientHello(hello, now)
+		serverHello, _, _, err := impostor.server.AnswerClientHello(hello, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -224,7 +224,7 @@ func TestReplayedClientHelloGivesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverHello, _, err := victim.server.AnswerClientHello(victimHello, now)
+	serverHello, _, _, err := victim.server.AnswerClientHello(victimHello, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,7 @@ func FuzzAnswerClientHello(f *testing.F) {
 	hello, _ := pair.client.NewClientHello()
 	f.Add(hello)
 	f.Fuzz(func(t *testing.T, clientHello []byte) {
-		_, _, _ = pair.server.AnswerClientHello(clientHello, now)
+		_, _, _, _ = pair.server.AnswerClientHello(clientHello, now)
 	})
 }
 
@@ -320,7 +320,7 @@ func FuzzFinishServerHello(f *testing.F) {
 	var pki = newTestPKI(f)
 	var pair = newHandshakePair(f, pki, pki.issue(f, nextYear), pki.issue(f, nextYear))
 	hello, _ := pair.client.NewClientHello()
-	serverHello, _, _ := pair.server.AnswerClientHello(hello, now)
+	serverHello, _, _, _ := pair.server.AnswerClientHello(hello, now)
 	f.Add(serverHello)
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		_, _ = ServerHelloClientID(packet)

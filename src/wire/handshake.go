@@ -48,7 +48,8 @@ import (
 //
 // wrap key = HKDF-SHA256(X25519 shared secret, salt = SHA-256(client hello ||
 // server hello 0..174), info = wrapKeyInfo). It is used once, so the zero
-// nonce is safe. The server clock lets the client relate the times in the
+// nonce is safe. The same secret and salt with another info give the key of
+// the client's reports, see report.go. The server clock lets the client relate the times in the
 // stream (codec chunk input times) to its own clock.
 const (
 	ClientHelloSize = 2 + CertificateSize + 32 + ed25519.SignatureSize
@@ -69,9 +70,10 @@ var ErrInvalidHandshake = errors.New("invalid handshake")
 // ServerHandshaker answers client hellos on the server.
 type ServerHandshaker interface {
 	// AnswerClientHello verifies a client hello and returns the server hello
-	// for that client along with the client's ID. now is the server clock,
-	// which the server hello carries.
-	AnswerClientHello(clientHello []byte, now time.Time) (serverHello []byte, clientID uuid.UUID, err error)
+	// for that client along with the client's ID and the opener of the
+	// reports the client sends after taking this answer (see report.go).
+	// now is the server clock, which the server hello carries.
+	AnswerClientHello(clientHello []byte, now time.Time) (serverHello []byte, clientID uuid.UUID, reports ClientReportOpener, err error)
 }
 
 // ClientHandshaker runs the handshake on a client.
@@ -80,9 +82,14 @@ type ClientHandshaker interface {
 	// hello is accepted only for the latest attempt.
 	NewClientHello() ([]byte, error)
 	// FinishServerHello verifies the server hello of the latest attempt and
-	// returns the opener for the stream and the server clock when it
-	// answered.
-	FinishServerHello(serverHello []byte, now time.Time) (opener StreamOpener, serverClock time.Time, err error)
+	// returns the keys it gave and the server clock when it answered.
+	FinishServerHello(serverHello []byte, now time.Time) (session ClientSession, serverClock time.Time, err error)
+}
+
+// ClientSession is what a finished handshake gives a client.
+type ClientSession struct {
+	Stream  StreamOpener       // opens the server's data packets
+	Reports ClientReportSealer // seals this client's reports to the server
 }
 
 // ServerHelloClientID returns the client a server hello is addressed to, for
@@ -123,32 +130,32 @@ type CertificateServerHandshake struct {
 	StreamKey   StreamKey
 }
 
-func (h *CertificateServerHandshake) AnswerClientHello(clientHello []byte, now time.Time) ([]byte, uuid.UUID, error) {
+func (h *CertificateServerHandshake) AnswerClientHello(clientHello []byte, now time.Time) ([]byte, uuid.UUID, ClientReportOpener, error) {
 	if len(clientHello) != ClientHelloSize || PacketKind(clientHello) != KindClientHello {
-		return nil, uuid.Nil, fmt.Errorf("%w: not a client hello", ErrInvalidHandshake)
+		return nil, uuid.Nil, nil, fmt.Errorf("%w: not a client hello", ErrInvalidHandshake)
 	}
 	clientCertificate, err := ParseCertificate(clientHello[2 : 2+CertificateSize])
 	if err != nil {
-		return nil, uuid.Nil, err
+		return nil, uuid.Nil, nil, err
 	}
 	if err := h.Verifier.VerifyCertificate(clientCertificate, now); err != nil {
-		return nil, uuid.Nil, err
+		return nil, uuid.Nil, nil, err
 	}
 	if !ed25519.Verify(clientCertificate.PublicKey, clientHello[:clientHelloSignedSize], clientHello[clientHelloSignedSize:]) {
-		return nil, uuid.Nil, fmt.Errorf("%w: bad client signature of %s", ErrInvalidHandshake, clientCertificate.ID)
+		return nil, uuid.Nil, nil, fmt.Errorf("%w: bad client signature of %s", ErrInvalidHandshake, clientCertificate.ID)
 	}
 	clientEphemeral, err := ecdh.X25519().NewPublicKey(clientHello[2+CertificateSize : clientHelloSignedSize])
 	if err != nil {
-		return nil, uuid.Nil, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
+		return nil, uuid.Nil, nil, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
 	}
 
 	serverEphemeral, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, uuid.Nil, err
+		return nil, uuid.Nil, nil, err
 	}
 	shared, err := serverEphemeral.ECDH(clientEphemeral)
 	if err != nil {
-		return nil, uuid.Nil, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
+		return nil, uuid.Nil, nil, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
 	}
 
 	var serverHello = make([]byte, ServerHelloSize)
@@ -161,13 +168,19 @@ func (h *CertificateServerHandshake) AnswerClientHello(clientHello []byte, now t
 
 	wrap, err := deriveWrapAEAD(shared, clientHello, serverHello[:serverHelloWrapAADSize])
 	if err != nil {
-		return nil, uuid.Nil, err
+		return nil, uuid.Nil, nil, err
 	}
 	wrap.Seal(serverHello[serverHelloWrapAADSize:serverHelloWrapAADSize], make([]byte, wrap.NonceSize()), h.StreamKey.Key[:], serverHello[:serverHelloWrapAADSize])
 	binary.BigEndian.PutUint64(serverHello[serverHelloClockStart:serverHelloSignedSize], uint64(now.UnixMilli()))
 
 	copy(serverHello[serverHelloSignedSize:], ed25519.Sign(h.Credentials.PrivateKey, serverHelloSigned(clientHello, serverHello)))
-	return serverHello, clientCertificate.ID, nil
+
+	reportAEAD, err := deriveReportAEAD(shared, clientHello, serverHello[:serverHelloWrapAADSize])
+	if err != nil {
+		return nil, uuid.Nil, nil, err
+	}
+	var reports = &AESGCMClientReportOpener{clientID: clientCertificate.ID, keyID: reportKeyID(serverHello), aead: reportAEAD}
+	return serverHello, clientCertificate.ID, reports, nil
 }
 
 // CertificateClientHandshake is the client side of the certificate handshake.
@@ -201,58 +214,63 @@ func (h *CertificateClientHandshake) NewClientHello() ([]byte, error) {
 	return hello, nil
 }
 
-func (h *CertificateClientHandshake) FinishServerHello(serverHello []byte, now time.Time) (StreamOpener, time.Time, error) {
+func (h *CertificateClientHandshake) FinishServerHello(serverHello []byte, now time.Time) (ClientSession, time.Time, error) {
 	h.mu.Lock()
 	var ephemeral, clientHello = h.ephemeral, h.hello
 	h.mu.Unlock()
 	if ephemeral == nil {
-		return nil, time.Time{}, fmt.Errorf("%w: no client hello sent", ErrInvalidHandshake)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: no client hello sent", ErrInvalidHandshake)
 	}
 
 	clientID, ok := ServerHelloClientID(serverHello)
 	if !ok {
-		return nil, time.Time{}, fmt.Errorf("%w: not a server hello", ErrInvalidHandshake)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: not a server hello", ErrInvalidHandshake)
 	}
 	if clientID != h.Credentials.Certificate.ID {
-		return nil, time.Time{}, fmt.Errorf("%w: server hello for %s", ErrInvalidHandshake, clientID)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: server hello for %s", ErrInvalidHandshake, clientID)
 	}
 	serverCertificate, err := ParseCertificate(serverHello[18 : 18+CertificateSize])
 	if err != nil {
-		return nil, time.Time{}, err
+		return ClientSession{}, time.Time{}, err
 	}
 	if serverCertificate.ID != h.ServerID {
-		return nil, time.Time{}, fmt.Errorf("%w: certificate %s is not the server %s", ErrInvalidHandshake, serverCertificate.ID, h.ServerID)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: certificate %s is not the server %s", ErrInvalidHandshake, serverCertificate.ID, h.ServerID)
 	}
 	if err := h.Verifier.VerifyCertificate(serverCertificate, now); err != nil {
-		return nil, time.Time{}, err
+		return ClientSession{}, time.Time{}, err
 	}
 	if !ed25519.Verify(serverCertificate.PublicKey, serverHelloSigned(clientHello, serverHello), serverHello[serverHelloSignedSize:]) {
-		return nil, time.Time{}, fmt.Errorf("%w: bad server signature, or the hello answers an older attempt", ErrInvalidHandshake)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: bad server signature, or the hello answers an older attempt", ErrInvalidHandshake)
 	}
 
 	serverEphemeral, err := ecdh.X25519().NewPublicKey(serverHello[18+CertificateSize : serverHelloEphemeralEnd])
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
 	}
 	shared, err := ephemeral.ECDH(serverEphemeral)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
 	}
 	wrap, err := deriveWrapAEAD(shared, clientHello, serverHello[:serverHelloWrapAADSize])
 	if err != nil {
-		return nil, time.Time{}, err
+		return ClientSession{}, time.Time{}, err
 	}
 	key, err := wrap.Open(nil, make([]byte, wrap.NonceSize()), serverHello[serverHelloWrapAADSize:serverHelloClockStart], serverHello[:serverHelloWrapAADSize])
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("%w: stream key: %w", ErrInvalidHandshake, err)
+		return ClientSession{}, time.Time{}, fmt.Errorf("%w: stream key: %w", ErrInvalidHandshake, err)
 	}
 
 	var streamKey = StreamKey{Epoch: binary.BigEndian.Uint32(serverHello[serverHelloEphemeralEnd:serverHelloWrapAADSize])}
 	copy(streamKey.Key[:], key)
 	opener, err := NewStreamOpener(streamKey)
 	if err != nil {
-		return nil, time.Time{}, err
+		return ClientSession{}, time.Time{}, err
 	}
+	reportAEAD, err := deriveReportAEAD(shared, clientHello, serverHello[:serverHelloWrapAADSize])
+	if err != nil {
+		return ClientSession{}, time.Time{}, err
+	}
+	var reports = &AESGCMClientReportSealer{clientID: clientID, keyID: reportKeyID(serverHello), aead: reportAEAD}
 	var serverClock = time.UnixMilli(int64(binary.BigEndian.Uint64(serverHello[serverHelloClockStart:serverHelloSignedSize])))
-	return opener, serverClock, nil
+	return ClientSession{Stream: opener, Reports: reports}, serverClock, nil
 }

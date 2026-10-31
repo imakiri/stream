@@ -34,10 +34,17 @@ Every packet starts with `version` (3) and `kind`
 | 2 client hello | client → server | 218 B | client certificate, ephemeral X25519 key, signature |
 | 3 server hello | server → that client | 294 B | client ID, server certificate, ephemeral key, wrapped stream key, server clock, signature |
 | 4 data | server → every client | 1086 B | 14-byte clear header (epoch, packet number) + AES-256-GCM sealed FEC packet |
+| 5 client report | client → server | 74 B | client ID, report key ID, number + sealed delay and losses (`src/wire/report.go`) |
 
 The relay routes by kind only: client hellos to the server, a server hello
-to the client whose ID it names, data to every client. Everything else, and
-data from clients, is dropped.
+to the client whose ID it names, data to every client, a client report to
+the server if its client ID is the sender's. Everything else, and data from
+clients, is dropped.
+
+The client reports are sealed with a key of their own per handshake, which
+the client and the server derive from the handshake like the stream key
+wrap: the relay cannot read them, and another client, which has the shared
+stream key, cannot forge them.
 
 ### Relay link and keepalive
 
@@ -140,6 +147,14 @@ the client, and the chunks lost meanwhile:
 `e2e delay p50 …, p99 …, max … over N chunks, lost K (M came short of packets)`.
 Chunks that came short of packets in groups of neighbours mean burst losses
 on the way; whole chunks missing mean longer breaks.
+
+The client sends the same numbers to the server as a client report, also
+while no data comes. The server logs when a client starts watching
+(`client … watches: e2e delay …`) and when its reports stop for 16 s, shows
+the clients on a status line, and logs the list once a minute:
+`2 clients watch: 66a9d020 e2e delay p50 121ms, …; f2a68dbc e2e delay …`.
+Clients of an older version handshake but send no reports; the list names
+them apart.
 
 ## Running it
 

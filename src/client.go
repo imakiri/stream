@@ -48,8 +48,8 @@ type Client struct {
 	decoder   *codec.Decoder
 	handshake wire.ClientHandshaker
 
-	opener           atomic.Pointer[wire.StreamOpener]
-	lastOpenUnixNano atomic.Int64 // a server hello or a data packet opened
+	session          atomic.Pointer[wire.ClientSession] // the keys of the last handshake; nil while there is none
+	lastOpenUnixNano atomic.Int64                       // a server hello or a data packet opened
 	// lastDataUnixNano is when the latest data packet opened; zero before
 	// the first. A server without input sends none, and the client
 	// handshakes again every few seconds.
@@ -118,14 +118,14 @@ func (c *Client) Run(ctx context.Context) error {
 	go c.keepHandshake(ctx, link)
 	go c.receive(ctx, input, decoderIn)
 	go c.play(player, decoderOut)
-	go c.reportStream(ctx)
+	go c.reportStream(ctx, link)
 
 	<-ctx.Done()
 	return nil
 }
 
 func (c *Client) streamWorks(now time.Time) bool {
-	return c.opener.Load() != nil && now.Sub(time.Unix(0, c.lastOpenUnixNano.Load())) < streamStaleTimeout
+	return c.session.Load() != nil && now.Sub(time.Unix(0, c.lastOpenUnixNano.Load())) < streamStaleTimeout
 }
 
 // keepHandshake sends client hellos while the client has no working stream
@@ -138,14 +138,14 @@ func (c *Client) keepHandshake(ctx context.Context, link io.Writer) {
 	for {
 		var now = time.Now()
 		if !c.streamWorks(now) {
-			if hello == nil || now.Sub(helloAt) > clientHelloAttemptTimeout || c.opener.Load() != nil {
+			if hello == nil || now.Sub(helloAt) > clientHelloAttemptTimeout || c.session.Load() != nil {
 				var err error
 				hello, err = c.handshake.NewClientHello()
 				if err != nil {
 					log.Printf("failed to create client hello: %s", err)
 				}
 				helloAt = now
-				c.opener.Store(nil)
+				c.session.Store(nil)
 			}
 			if hello != nil {
 				c.lastHelloSentUnixNano.Store(time.Now().UnixNano())
@@ -182,24 +182,24 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 		switch wire.PacketKind(buf[:n]) {
 		case wire.KindServerHello:
 			var receivedAt = time.Now()
-			opener, serverClock, err := c.handshake.FinishServerHello(buf[:n], receivedAt)
+			session, serverClock, err := c.handshake.FinishServerHello(buf[:n], receivedAt)
 			if err != nil {
 				log.Printf("rejected server hello: %s", err)
 				continue
 			}
 			c.lastOpenUnixNano.Store(receivedAt.UnixNano())
-			c.opener.Store(&opener)
+			c.session.Store(&session)
 			var clock = c.syncServerClock(serverClock, receivedAt)
-			if !epochLogged || opener.Epoch() != loggedEpoch {
-				log.Printf("handshake with server %s, stream key epoch %08x; %s", c.cfg.ServerID, opener.Epoch(), clock)
-				loggedEpoch, epochLogged = opener.Epoch(), true
+			if epoch := session.Stream.Epoch(); !epochLogged || epoch != loggedEpoch {
+				log.Printf("handshake with server %s, stream key epoch %08x; %s", c.cfg.ServerID, epoch, clock)
+				loggedEpoch, epochLogged = epoch, true
 			}
 		case wire.KindData:
-			var opener = c.opener.Load()
-			if opener == nil {
+			var session = c.session.Load()
+			if session == nil {
 				continue
 			}
-			payload, err := (*opener).OpenData(buf[:n])
+			payload, err := session.Stream.OpenData(buf[:n])
 			if err != nil {
 				continue // another stream key until the handshake catches up, or forged
 			}
@@ -240,8 +240,9 @@ func (c *Client) serverNow() (time.Time, bool) {
 
 // reportStream logs the end-to-end delay and the lost chunks every
 // e2eDelayReportInterval while data comes, and once when the data stops or
-// comes again.
-func (c *Client) reportStream(ctx context.Context) {
+// comes again. It sends the same numbers to the server as a client report,
+// also while no data comes, so the server knows the client is there.
+func (c *Client) reportStream(ctx context.Context, link io.Writer) {
 	var ticker = time.NewTicker(e2eDelayReportInterval)
 	defer ticker.Stop()
 	var flow dataFlow
@@ -255,9 +256,13 @@ func (c *Client) reportStream(ctx context.Context) {
 				log.Print(change)
 			}
 			var lost, incomplete = c.decoder.Losses()
-			if samples := c.e2eDelays.take(); len(samples) > 0 {
-				log.Print(formatStreamReport(samples, lost-reportedLost, incomplete-reportedIncomplete))
-				reportedLost, reportedIncomplete = lost, incomplete
+			var report = newClientReport(c.e2eDelays.take(), lost-reportedLost, incomplete-reportedIncomplete)
+			reportedLost, reportedIncomplete = lost, incomplete
+			if report.Chunks > 0 {
+				log.Print(formatStreamReport(report))
+			}
+			if session := c.session.Load(); session != nil {
+				_, _ = link.Write(session.Reports.SealClientReport(report))
 			}
 		}
 	}

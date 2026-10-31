@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/imakiri/stream/src/codec"
+	"github.com/imakiri/stream/src/liveoutput"
 	"github.com/imakiri/stream/src/observer"
 	"github.com/imakiri/stream/src/wire"
 )
@@ -41,7 +42,8 @@ type ServerConfig struct {
 	Encoder         EncoderConfig
 	Credentials     wire.Credentials
 	Verifier        wire.CertificateVerifier
-	OutputReporter  observer.Reporter // optional: speed of what goes to the relay
+	OutputReporter  observer.Reporter  // optional: speed of what goes to the relay
+	ViewersOutput   *liveoutput.Output // optional: a status line with the clients that watch
 }
 
 // Server takes the stream from OBS, adds FEC, seals it with the stream key
@@ -52,6 +54,7 @@ type Server struct {
 	encoder   *codec.Encoder
 	handshake wire.ServerHandshaker
 	sealer    wire.StreamSealer
+	viewers   *viewers
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
@@ -75,7 +78,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			Verifier:    cfg.Verifier,
 			StreamKey:   streamKey,
 		},
-		sealer: sealer,
+		sealer:  sealer,
+		viewers: newViewers(cfg.ViewersOutput),
 	}, nil
 }
 
@@ -111,7 +115,8 @@ func (s *Server) Run(ctx context.Context) error {
 
 	go s.readStreamInput(ctx, streamInput, encoderIn)
 	go s.sendStream(output, encoderOut)
-	go s.answerHandshakes(output)
+	go s.serveClientPackets(output)
+	go s.watchViewers(ctx)
 
 	<-ctx.Done()
 	return nil
@@ -150,8 +155,9 @@ func (s *Server) sendStream(link io.Writer, encoderOut <-chan []byte) {
 	}
 }
 
-// answerHandshakes answers every client hello the relay hands over.
-func (s *Server) answerHandshakes(link io.ReadWriter) {
+// serveClientPackets answers the client hellos and takes the client
+// reports the relay hands over.
+func (s *Server) serveClientPackets(link io.ReadWriter) {
 	var buf = make([]byte, packetBufferSize)
 	for {
 		n, err := link.Read(buf)
@@ -162,18 +168,45 @@ func (s *Server) answerHandshakes(link io.ReadWriter) {
 			log.Printf("failed to read from relay: %s", err)
 			continue
 		}
-		if wire.PacketKind(buf[:n]) != wire.KindClientHello {
-			continue
+		switch wire.PacketKind(buf[:n]) {
+		case wire.KindClientHello:
+			var now = time.Now()
+			serverHello, clientID, reportKey, err := s.handshake.AnswerClientHello(buf[:n], now)
+			if err != nil {
+				log.Printf("rejected client hello: %s", err)
+				continue
+			}
+			if _, err := link.Write(serverHello); err != nil {
+				return
+			}
+			s.viewers.handshake(clientID, reportKey, now)
+			log.Printf("handshake with client %s", clientID)
+		case wire.KindClientReport:
+			if err := s.viewers.report(buf[:n], time.Now()); err != nil {
+				log.Printf("rejected client report: %s", err)
+			}
 		}
-		serverHello, clientID, err := s.handshake.AnswerClientHello(buf[:n], time.Now())
-		if err != nil {
-			log.Printf("rejected client hello: %s", err)
-			continue
-		}
-		if _, err := link.Write(serverHello); err != nil {
+	}
+}
+
+// watchViewers notes the clients that stop reporting and logs the list of
+// clients every viewerSummaryInterval while there are any.
+func (s *Server) watchViewers(ctx context.Context) {
+	var check = time.NewTicker(ClientReportInterval)
+	defer check.Stop()
+	var summary = time.NewTicker(viewerSummaryInterval)
+	defer summary.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case now := <-check.C:
+			s.viewers.check(now)
+		case now := <-summary.C:
+			if line, hasViewers := s.viewers.summary(now); hasViewers {
+				log.Print(line)
+			}
 		}
-		log.Printf("handshake with client %s", clientID)
 	}
 }
 

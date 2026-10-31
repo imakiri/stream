@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,7 +76,9 @@ func (r testRoot) issue(t *testing.T) wire.Credentials {
 
 var testFec = FecConfig{DataParts: 4, TotalParts: 6}
 
-func startTestServer(t *testing.T, ctx context.Context, relayCfg RelayConfig, root testRoot, creds wire.Credentials) uint16 {
+// startTestServer starts a server and returns the port of its stream input
+// and the server.
+func startTestServer(t *testing.T, ctx context.Context, relayCfg RelayConfig, root testRoot, creds wire.Credentials) (uint16, *Server) {
 	t.Helper()
 	var inputPort = freeUDPPort(t)
 	server, err := NewServer(ServerConfig{
@@ -95,7 +98,7 @@ func startTestServer(t *testing.T, ctx context.Context, relayCfg RelayConfig, ro
 			t.Error(err)
 		}
 	}()
-	return inputPort
+	return inputPort, server
 }
 
 // startTestPlayer starts a client and returns the UDP socket of its player.
@@ -242,11 +245,26 @@ func TestStreamReachesClientsOverUDPAndTCP(t *testing.T) {
 	var serverCreds = root.issue(t)
 	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
 	var tcp = RelayConfig{Network: RelayNetworkTCP, Addr: addr, Port: port}
-	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
-	var udpPlayer = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
-	var tcpPlayer = startTestPlayer(t, ctx, tcp, root.pub, root.issue(t), serverCreds.Certificate.ID)
+	var inputPort, server = startTestServer(t, ctx, udp, root, serverCreds)
+	var udpClient, tcpClient = root.issue(t), root.issue(t)
+	var udpPlayer = startTestPlayer(t, ctx, udp, root.pub, udpClient, serverCreds.Certificate.ID)
+	var tcpPlayer = startTestPlayer(t, ctx, tcp, root.pub, tcpClient, serverCreds.Certificate.ID)
 
 	streamUntilPlayed(t, inputPort, nil, 64<<10, udpPlayer, tcpPlayer)
+
+	// both clients report to the server within a report interval
+	var deadline = time.Now().Add(ClientReportInterval + 3*time.Second)
+	for {
+		var summary, _ = server.viewers.summary(time.Now())
+		if strings.HasPrefix(summary, "2 clients watch") &&
+			strings.Contains(summary, shortID(udpClient.Certificate.ID)) && strings.Contains(summary, shortID(tcpClient.Certificate.ID)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the server sees: %s", summary)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // TestStreamRejectsClientOfAnotherRoot checks that a client whose
@@ -264,7 +282,7 @@ func TestStreamRejectsClientOfAnotherRoot(t *testing.T) {
 	var root = newTestRoot(t)
 	var serverCreds = root.issue(t)
 	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
-	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
+	var inputPort, _ = startTestServer(t, ctx, udp, root, serverCreds)
 	var trusted = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
 	var stranger = newTestRoot(t)
 	// trusts our root, so it would accept the server, but its own
@@ -296,13 +314,13 @@ func TestStreamClientFollowsRestartedServer(t *testing.T) {
 	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
 
 	firstCtx, stopFirst := context.WithCancel(ctx)
-	var inputPort = startTestServer(t, firstCtx, udp, root, serverCreds)
+	var inputPort, _ = startTestServer(t, firstCtx, udp, root, serverCreds)
 	var player = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
 	var firstStream = streamUntilPlayed(t, inputPort, nil, 16<<10, player)
 	stopFirst()
 
 	// the player may still get the end of the first stream from the client
-	inputPort = startTestServer(t, ctx, udp, root, serverCreds)
+	inputPort, _ = startTestServer(t, ctx, udp, root, serverCreds)
 	streamUntilPlayed(t, inputPort, firstStream, 16<<10, player)
 }
 
@@ -324,7 +342,7 @@ func TestStreamSurvivesRelayRestart(t *testing.T) {
 			var root = newTestRoot(t)
 			var serverCreds = root.issue(t)
 			var link = RelayConfig{Network: network, Addr: addr, Port: port}
-			var inputPort = startTestServer(t, ctx, link, root, serverCreds)
+			var inputPort, _ = startTestServer(t, ctx, link, root, serverCreds)
 			var player = startTestPlayer(t, ctx, link, root.pub, root.issue(t), serverCreds.Certificate.ID)
 			var firstStream = streamUntilPlayed(t, inputPort, nil, 16<<10, player)
 
@@ -359,7 +377,7 @@ func TestStreamClientPlaysNothingForged(t *testing.T) {
 	var root = newTestRoot(t)
 	var serverCreds = root.issue(t)
 	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
-	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
+	var inputPort, _ = startTestServer(t, ctx, udp, root, serverCreds)
 	var player = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
 
 	// the attacker listens as a client for the epoch while the stream runs
