@@ -6,17 +6,17 @@ correction instead of retransmissions, so a lost packet costs no round trip,
 and it is end-to-end encrypted: the relay sees only sealed packets.
 
 ```
-OBS ──udp──▶ server ──udp/tcp──▶ proxy ──udp/tcp──▶ client ──udp──▶ ffplay
+OBS ──udp──▶ server ──udp/tcp──▶ relay ──udp/tcp──▶ client ──udp──▶ ffplay
  (local)     (source)            (public host)       (viewer)        (local)
 ```
 
 - **server**: the stream source. Takes mpegts from OBS on a local UDP port,
   cuts it into chunks, adds Reed-Solomon parity, seals every packet with the
-  stream key and sends one copy to the proxy. It owns the CA that admits
+  stream key and sends one copy to the relay. It owns the CA that admits
   clients.
-- **proxy**: a relay on a host everyone can reach. It knows nothing about
+- **relay**: runs on a host everyone can reach. It knows nothing about
   keys; it routes packets by kind and keeps the peers registered. One server
-  per proxy.
+  per relay.
 - **client**: a viewer. Gets the stream key from the server in a handshake,
   opens the packets, restores the chunks with FEC and sends the mpegts to a
   local player.
@@ -30,29 +30,49 @@ Every packet starts with `version` (3) and `kind`
 
 | kind | from → to | size | content |
 |---|---|---|---|
-| 1 proxy hello | peer → proxy, echoed back | 19 B | role (server/client), peer ID |
+| 1 relay hello | peer → relay, echoed back | 19 B | role (server/client), peer ID |
 | 2 client hello | client → server | 218 B | client certificate, ephemeral X25519 key, signature |
 | 3 server hello | server → that client | 294 B | client ID, server certificate, ephemeral key, wrapped stream key, server clock, signature |
 | 4 data | server → every client | 1086 B | 14-byte clear header (epoch, packet number) + AES-256-GCM sealed FEC packet |
 
-The proxy routes by kind only: client hellos to the server, a server hello
+The relay routes by kind only: client hellos to the server, a server hello
 to the client whose ID it names, data to every client. Everything else, and
 data from clients, is dropped.
 
-### Proxy link and keepalive
+### Relay link and keepalive
 
-Server and client talk to the proxy over UDP or TCP (TCP frames packets with
-a 2-byte length; it can go through a socks5 proxy). The connection is a
-`ProxyLink` (`src/link.go`): it repeats the proxy hello every 5 s, which
-registers the peer and keeps NAT mappings open, and the proxy echoes it. When
+Server and client talk to the relay over UDP or TCP (TCP frames packets with
+a 2-byte length). The connection is a
+`RelayLink` (`src/link.go`): it repeats the relay hello every 5 s, which
+registers the peer and keeps NAT mappings open, and the relay echoes it. When
 no echo comes for 15 s, or a TCP connection fails, the link dials again with
 a backoff of 1 to 10 s; meanwhile writes are dropped, the stream is real
-time. The proxy follows a UDP peer to a new address on its next hello and
+time. The relay follows a UDP peer to a new address on its next hello and
 forgets peers that were silent for 30 s.
 
 The link dials again from the previous local address while the machine has
 it, so a VPN that comes up for a while (e.g. WARP) pauses the stream rather
 than taking it over.
+
+### Proxy
+
+Where the relay cannot be reached directly or its traffic is blocked, the
+link can go through a proxy, set in the `[proxy]` section of the config
+(`src/proxy.go`), one at most:
+
+- `[proxy.socks5] url = "socks5://127.0.0.1:2080"`: a SOCKS5 proxy such as a
+  local sing-box, TCP only. Over TCP a lost packet is resent rather than
+  skipped, so losses turn into stalls and delay instead of FEC repairs.
+- `[proxy.amneziawg] config = "amneziawg.conf"`: an AmneziaWG tunnel
+  (WireGuard with obfuscation against DPI) run inside the program
+  (`src/amneziawg`, on `amneziawg-go` and the gVisor network stack), UDP or
+  TCP. Only the stream goes into the tunnel: no system VPN, no admin rights.
+  The config is the file the Amnezia app exports (`[Interface]` with
+  `PrivateKey`, `Address`, `Jc`, `Jmin`, `Jmax`, `S1`, `S2`, `H1`-`H4`...,
+  `[Peer]` with `PublicKey`, `Endpoint`, `AllowedIPs`); the path is relative
+  to the config file. A plain WireGuard config works too. The relay address
+  is resolved by the tunnel's `DNS` if the config has one, else by the
+  system.
 
 Packets are marked DSCP EF (46), which home routers and Wi-Fi put into the
 voice/video queue.
@@ -97,7 +117,7 @@ the defaults). Sent back to back they leave at the speed of the network card,
 and a shaper on the way (home router, provider) cuts off the tail of the
 burst: 15-25 packets in a row, more than FEC restores. So the server paces the
 data packets (`src/pacer.go`, `[pacing] rate_mbit` in `server.cfg`, 30 Mbit/s
-by default, about three times the wire rate). The proxy forwards each packet
+by default, about three times the wire rate). The relay forwards each packet
 as it comes, so this smooths the way to the clients too. The price is the
 time a big frame takes at that rate: ~25 ms for a 75 KB keyframe with its
 parity, ~5 ms for an ordinary frame.
@@ -126,24 +146,24 @@ on the way; whole chunks missing mean longer breaks.
 Build with Go 1.25 or newer, for the machine each part runs on:
 
 ```
-GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o proxy  ./cmd/proxy
+GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o relay  ./cmd/relay
 GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -o server ./cmd/server
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o client.exe ./cmd/client
 ```
 
-Ports used by default: proxy `25565` (UDP and TCP), server input from OBS
+Ports used by default: relay `25565` (UDP and TCP), server input from OBS
 `2557` (UDP, localhost), client output to the player `25566` (UDP,
 localhost).
 
-### Proxy (public host)
+### Relay (public host)
 
-Copy the binary to `/opt/stream/proxy` and install the systemd unit from
-`deploy/stream-proxy.service`:
+Copy the binary to `/opt/stream/relay` and install the systemd unit from
+`deploy/stream-relay.service`:
 
 ```
-scp proxy root@host:/opt/stream/proxy
-scp deploy/stream-proxy.service root@host:/etc/systemd/system/
-ssh root@host 'systemctl daemon-reload && systemctl enable --now stream-proxy'
+scp relay root@host:/opt/stream/relay
+scp deploy/stream-relay.service root@host:/etc/systemd/system/
+ssh root@host 'systemctl daemon-reload && systemctl enable --now stream-relay'
 ```
 
 Open port 25565 for UDP and TCP in the firewall. For viewers on TCP, use BBR
@@ -156,14 +176,14 @@ printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > 
 modprobe tcp_bbr && sysctl --system && tc qdisc replace dev eth0 root fq
 ```
 
-Logs: `journalctl -u stream-proxy -f` (the speed line is shown only on a
+Logs: `journalctl -u stream-relay -f` (the speed line is shown only on a
 terminal, not in the journal). To update, copy the new binary and
-`systemctl restart stream-proxy`; peers register again on their own.
+`systemctl restart stream-relay`; peers register again on their own.
 
 ### Server (streamer)
 
 1. Put `server` and `server.cfg` (from `cmd/server/server.example.cfg`) in
-   one directory and set `[proxy] addr` to the proxy host.
+   one directory and set `[relay] addr` to the relay host.
 2. Start it once: `./server`. It creates `ca.key`, `server.key` and
    `server.cert` next to the binary. Keep `ca.key` secret: whoever has it can
    admit clients. Losing it means enrolling every client again.
@@ -222,16 +242,15 @@ next to the binary), `-sign <key>` and `-days <n>`.
 ### Client (viewer)
 
 1. Put `client` (`client.exe`) and `client.cfg` (from
-   `cmd/client/client.example.cfg`) in one directory. Set `[proxy] addr` to
-   the proxy host and, if UDP does not get through, `network = "tcp"`
-   (optionally with `socks_proxy`, e.g. a local sing-box). `[fec]` must match
-   the server.
+   `cmd/client/client.example.cfg`) in one directory. Set `[relay] addr` to
+   the relay host and, if UDP does not get through, `network = "tcp"`, or
+   a `[proxy]` (see [Proxy](#proxy)). `[fec]` must match the server.
 2. Start it: `./client`. On the first start it makes `client.key`, prints
    the public key and copies it to the clipboard. Send the key to the
    streamer, paste the enrollment they send back, and the client saves it as
    `client.enrollment`. Next starts connect right away.
 3. Start the player. mpv with the script from `player/` keeps closest to
-   live (measured from screen to screen through the proxy: ~285 ms with mpv;
+   live (measured from screen to screen through the relay: ~285 ms with mpv;
    ffplay keeps ~0.35 s of video queued and showed the picture ~290 ms
    later than mpv; `player/play-mpv.sh` and `player/play-mpv.bat` run this):
    ```
@@ -265,31 +284,32 @@ The client log shows the handshake with the clock offset to the server
 (again only when the stream key changes), the end-to-end delay and the lost
 chunks every 5 s, and one line when the data from the server stops or comes
 again: a server without input from OBS answers handshakes but sends no data. The speed of what comes
-from the proxy stays on the bottom line of the terminal.
+from the relay stays on the bottom line of the terminal.
 
 ## Measuring the link
 
-`cmd/stats` sends stream-sized packets through the proxy and records their
+`cmd/stats` sends stream-sized packets through the relay and records their
 delay:
 
 ```
-stats -mode reader -addr <proxy host> -network udp -out received
-stats -mode writer -addr <proxy host> -network udp -rate 1250
+stats -mode reader -addr <relay host> -network udp -out received
+stats -mode writer -addr <relay host> -network udp -rate 1250
 ```
 
 The writer registers as the server, so it replaces a running server while it
 runs. Each line of `received` is `<packet number> <sent unix ns> <received
 unix ns>`; with both on one machine the delay is a round trip through the
-proxy.
+relay.
 
 ## Code
 
 | path | what |
 |---|---|
-| `cmd/proxy`, `src/proxy` | the relay |
+| `cmd/relay`, `src/relay` | the relay |
 | `cmd/server`, `src/server.go` | the source |
 | `cmd/client`, `src/client.go` | the viewer |
-| `src/link.go` | `ProxyLink`: connection to the proxy, keepalive, reconnects |
+| `src/link.go` | `RelayLink`: connection to the relay, keepalive, reconnects |
+| `src/proxy.go`, `src/amneziawg` | the way to the relay through a socks5 proxy or an AmneziaWG tunnel |
 | `src/wire` | packet kinds, certificates, handshake, data packet sealing |
 | `src/codec` | FEC encoder and decoder |
 | `src/frame` | packet framing over TCP |

@@ -1,5 +1,5 @@
 // Command server is the stream source: it takes the mpegts stream from OBS
-// over local UDP and sends it with FEC to every client through the proxy.
+// over local UDP and sends it with FEC to every client through the relay.
 //
 // On the first start it makes a CA and its own certificate in the key
 // directory (by default next to the binary). A new client prints its public

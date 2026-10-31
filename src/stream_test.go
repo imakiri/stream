@@ -14,7 +14,7 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/imakiri/stream/src/liveoutput"
-	"github.com/imakiri/stream/src/proxy"
+	"github.com/imakiri/stream/src/relay"
 	"github.com/imakiri/stream/src/wire"
 )
 
@@ -28,8 +28,8 @@ func freeUDPPort(t *testing.T) uint16 {
 	return uint16(conn.LocalAddr().(*net.UDPAddr).Port)
 }
 
-// freeProxyAddr returns a localhost port free for both udp and tcp.
-func freeProxyAddr(t *testing.T) (string, uint16) {
+// freeRelayAddr returns a localhost port free for both udp and tcp.
+func freeRelayAddr(t *testing.T) (string, uint16) {
 	t.Helper()
 	for range 20 {
 		l, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -75,11 +75,11 @@ func (r testRoot) issue(t *testing.T) wire.Credentials {
 
 var testFec = FecConfig{DataParts: 4, TotalParts: 6}
 
-func startTestServer(t *testing.T, ctx context.Context, proxyCfg ProxyConfig, root testRoot, creds wire.Credentials) uint16 {
+func startTestServer(t *testing.T, ctx context.Context, relayCfg RelayConfig, root testRoot, creds wire.Credentials) uint16 {
 	t.Helper()
 	var inputPort = freeUDPPort(t)
 	server, err := NewServer(ServerConfig{
-		Proxy:           proxyCfg,
+		Relay:           relayCfg,
 		StreamInputPort: inputPort,
 		PacingRate:      DefaultPacingRate,
 		Fec:             testFec,
@@ -99,7 +99,7 @@ func startTestServer(t *testing.T, ctx context.Context, proxyCfg ProxyConfig, ro
 }
 
 // startTestPlayer starts a client and returns the UDP socket of its player.
-func startTestPlayer(t *testing.T, ctx context.Context, proxyCfg ProxyConfig, root ed25519.PublicKey, creds wire.Credentials, serverID uuid.UUID) *net.UDPConn {
+func startTestPlayer(t *testing.T, ctx context.Context, relayCfg RelayConfig, root ed25519.PublicKey, creds wire.Credentials, serverID uuid.UUID) *net.UDPConn {
 	t.Helper()
 	player, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -107,7 +107,7 @@ func startTestPlayer(t *testing.T, ctx context.Context, proxyCfg ProxyConfig, ro
 	}
 	t.Cleanup(func() { player.Close() })
 	client, err := NewClient(ClientConfig{
-		Proxy:       proxyCfg,
+		Relay:       relayCfg,
 		PlayerPort:  uint16(player.LocalAddr().(*net.UDPAddr).Port),
 		Fec:         testFec,
 		Decoder:     DecoderConfig{AssemblerSize: 16, DispatcherSize: 8},
@@ -225,14 +225,14 @@ func streamUntilPlayed(t *testing.T, inputPort uint16, earlier []byte, want int,
 	return sent.Bytes()
 }
 
-// TestStreamReachesClientsOverUDPAndTCP runs a proxy, a server on UDP and
+// TestStreamReachesClientsOverUDPAndTCP runs a relay, a server on UDP and
 // two clients, one on UDP and one on TCP, and checks the stream from OBS
 // arrives at both players.
 func TestStreamReachesClientsOverUDPAndTCP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	addr, port := freeProxyAddr(t)
-	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
+	addr, port := freeRelayAddr(t)
+	var p = relay.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -240,8 +240,8 @@ func TestStreamReachesClientsOverUDPAndTCP(t *testing.T) {
 
 	var root = newTestRoot(t)
 	var serverCreds = root.issue(t)
-	var udp = ProxyConfig{Network: ProxyNetworkUDP, Addr: addr, Port: port}
-	var tcp = ProxyConfig{Network: ProxyNetworkTCP, Addr: addr, Port: port}
+	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
+	var tcp = RelayConfig{Network: RelayNetworkTCP, Addr: addr, Port: port}
 	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
 	var udpPlayer = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
 	var tcpPlayer = startTestPlayer(t, ctx, tcp, root.pub, root.issue(t), serverCreds.Certificate.ID)
@@ -254,8 +254,8 @@ func TestStreamReachesClientsOverUDPAndTCP(t *testing.T) {
 func TestStreamRejectsClientOfAnotherRoot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	addr, port := freeProxyAddr(t)
-	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
+	addr, port := freeRelayAddr(t)
+	var p = relay.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestStreamRejectsClientOfAnotherRoot(t *testing.T) {
 
 	var root = newTestRoot(t)
 	var serverCreds = root.issue(t)
-	var udp = ProxyConfig{Network: ProxyNetworkUDP, Addr: addr, Port: port}
+	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
 	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
 	var trusted = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
 	var stranger = newTestRoot(t)
@@ -284,8 +284,8 @@ func TestStreamRejectsClientOfAnotherRoot(t *testing.T) {
 func TestStreamClientFollowsRestartedServer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	addr, port := freeProxyAddr(t)
-	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
+	addr, port := freeRelayAddr(t)
+	var p = relay.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestStreamClientFollowsRestartedServer(t *testing.T) {
 
 	var root = newTestRoot(t)
 	var serverCreds = root.issue(t)
-	var udp = ProxyConfig{Network: ProxyNetworkUDP, Addr: addr, Port: port}
+	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
 
 	firstCtx, stopFirst := context.WithCancel(ctx)
 	var inputPort = startTestServer(t, firstCtx, udp, root, serverCreds)
@@ -306,31 +306,31 @@ func TestStreamClientFollowsRestartedServer(t *testing.T) {
 	streamUntilPlayed(t, inputPort, firstStream, 16<<10, player)
 }
 
-// TestStreamSurvivesProxyRestart restarts the proxy, which forgets every
+// TestStreamSurvivesRelayRestart restarts the relay, which forgets every
 // peer and, over TCP, breaks their connections, and checks that the server
 // and the client register again and the stream plays on.
-func TestStreamSurvivesProxyRestart(t *testing.T) {
-	for _, network := range []ProxyNetwork{ProxyNetworkUDP, ProxyNetworkTCP} {
+func TestStreamSurvivesRelayRestart(t *testing.T) {
+	for _, network := range []RelayNetwork{RelayNetworkUDP, RelayNetworkTCP} {
 		t.Run(string(network), func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			addr, port := freeProxyAddr(t)
-			var proxyAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
-			var p = proxy.New(proxyAddr, liveoutput.New(io.Discard))
+			addr, port := freeRelayAddr(t)
+			var relayAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
+			var p = relay.New(relayAddr, liveoutput.New(io.Discard))
 			if err := p.Serve(); err != nil {
 				t.Fatal(err)
 			}
 
 			var root = newTestRoot(t)
 			var serverCreds = root.issue(t)
-			var link = ProxyConfig{Network: network, Addr: addr, Port: port}
+			var link = RelayConfig{Network: network, Addr: addr, Port: port}
 			var inputPort = startTestServer(t, ctx, link, root, serverCreds)
 			var player = startTestPlayer(t, ctx, link, root.pub, root.issue(t), serverCreds.Certificate.ID)
 			var firstStream = streamUntilPlayed(t, inputPort, nil, 16<<10, player)
 
 			p.Close()
 			time.Sleep(300 * time.Millisecond)
-			p = proxy.New(proxyAddr, liveoutput.New(io.Discard))
+			p = relay.New(relayAddr, liveoutput.New(io.Discard))
 			if err := p.Serve(); err != nil {
 				t.Fatal(err)
 			}
@@ -341,16 +341,16 @@ func TestStreamSurvivesProxyRestart(t *testing.T) {
 }
 
 // TestStreamClientPlaysNothingForged lets an attacker who knows only the
-// proxy address take the server's place there, as the proxy authenticates
+// relay address take the server's place there, as the relay authenticates
 // nobody, and send data packets with the real stream's epoch, which it read
 // as a client. The client must play none of it, and the stream must come back
 // once the real server repeats its registration.
 func TestStreamClientPlaysNothingForged(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	addr, port := freeProxyAddr(t)
-	var proxyAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
-	var p = proxy.New(proxyAddr, liveoutput.New(io.Discard))
+	addr, port := freeRelayAddr(t)
+	var relayAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
+	var p = relay.New(relayAddr, liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -358,12 +358,12 @@ func TestStreamClientPlaysNothingForged(t *testing.T) {
 
 	var root = newTestRoot(t)
 	var serverCreds = root.issue(t)
-	var udp = ProxyConfig{Network: ProxyNetworkUDP, Addr: addr, Port: port}
+	var udp = RelayConfig{Network: RelayNetworkUDP, Addr: addr, Port: port}
 	var inputPort = startTestServer(t, ctx, udp, root, serverCreds)
 	var player = startTestPlayer(t, ctx, udp, root.pub, root.issue(t), serverCreds.Certificate.ID)
 
 	// the attacker listens as a client for the epoch while the stream runs
-	var spy = dialRawProxy(t, proxyAddr, wire.RoleClient)
+	var spy = dialRawRelay(t, relayAddr, wire.RoleClient)
 	var epoch = make(chan []byte, 1)
 	go func() {
 		var buf = make([]byte, packetBufferSize)
@@ -398,7 +398,7 @@ func TestStreamClientPlaysNothingForged(t *testing.T) {
 			got.Write(buf[:n])
 		}
 	}()
-	var hijacker = dialRawProxy(t, proxyAddr, wire.RoleServer)
+	var hijacker = dialRawRelay(t, relayAddr, wire.RoleServer)
 	var forged = make([]byte, 1086)
 	for i := range 2000 {
 		_, _ = rand.Read(forged)
@@ -420,16 +420,16 @@ func TestStreamClientPlaysNothingForged(t *testing.T) {
 	streamUntilPlayed(t, inputPort, firstStream, 16<<10, player)
 }
 
-// dialRawProxy registers a bare UDP socket at the proxy, the way anyone who
+// dialRawRelay registers a bare UDP socket at the relay, the way anyone who
 // knows its address can.
-func dialRawProxy(t *testing.T, proxyAddr string, role wire.Role) net.Conn {
+func dialRawRelay(t *testing.T, relayAddr string, role wire.Role) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("udp4", proxyAddr)
+	conn, err := net.Dial("udp4", relayAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	if err := exchangeProxyHello(conn, wire.MarshalProxyHello(role, uuid.Must(uuid.NewV4())), proxyHelloUDPAttempts); err != nil {
+	if err := exchangeRelayHello(conn, wire.MarshalRelayHello(role, uuid.Must(uuid.NewV4())), relayHelloUDPAttempts); err != nil {
 		t.Fatal(err)
 	}
 	return conn

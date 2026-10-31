@@ -17,7 +17,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
-// The handshake runs between a client and the server through the proxy, like
+// The handshake runs between a client and the server through the relay, like
 // mutual TLS with a two-level PKI: both sides show a certificate signed by
 // the root. The client sends its certificate and an ephemeral X25519 key; the
 // server answers with its certificate, its ephemeral key and the stream key
@@ -38,7 +38,7 @@ import (
 //
 //	0         version
 //	1         kind = KindServerHello
-//	2..18     client ID: the proxy routes the hello to this client
+//	2..18     client ID: the relay routes the hello to this client
 //	18..138   server certificate
 //	138..170  server ephemeral X25519 public key
 //	170..174  stream key epoch, big endian
@@ -86,7 +86,7 @@ type ClientHandshaker interface {
 }
 
 // ServerHelloClientID returns the client a server hello is addressed to, for
-// the proxy.
+// the relay.
 func ServerHelloClientID(serverHello []byte) (uuid.UUID, bool) {
 	if len(serverHello) != ServerHelloSize || PacketKind(serverHello) != KindServerHello {
 		return uuid.Nil, false

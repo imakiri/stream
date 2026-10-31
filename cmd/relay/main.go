@@ -1,4 +1,4 @@
-// Command proxy relays the stream between the server and its clients.
+// Command relay forwards the stream between the server and its clients.
 package main
 
 import (
@@ -8,7 +8,7 @@ import (
 	"os/signal"
 
 	"github.com/imakiri/stream/src/liveoutput"
-	"github.com/imakiri/stream/src/proxy"
+	"github.com/imakiri/stream/src/relay"
 )
 
 func main() {
@@ -18,7 +18,7 @@ func main() {
 	var output = liveoutput.New(os.Stdout)
 	log.SetOutput(output.Log())
 
-	var p = proxy.New(*addr, output)
+	var p = relay.New(*addr, output)
 	if err := p.Serve(); err != nil {
 		log.Fatalln(err)
 	}

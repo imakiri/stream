@@ -16,7 +16,7 @@ const pacerBurst = time.Millisecond
 // the packets of a whole interleave group at once (40 packets with the
 // default settings); sent back to back they leave at the speed of the
 // network card and a shaper on the way cuts off the tail of the burst,
-// more packets of a chunk than FEC can restore. The proxy forwards each
+// more packets of a chunk than FEC can restore. The relay forwards each
 // packet as it comes, so pacing at the server smooths both legs.
 type pacer struct {
 	bitsPerSecond uint64

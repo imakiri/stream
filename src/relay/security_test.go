@@ -1,4 +1,4 @@
-package proxy
+package relay
 
 import (
 	"crypto/rand"
@@ -8,10 +8,10 @@ import (
 	"github.com/imakiri/stream/src/wire"
 )
 
-// TestProxyDropsHellosFromTheWrongRole checks that a client cannot send
+// TestRelayDropsHellosFromTheWrongRole checks that a client cannot send
 // server hellos to other clients, nor client hellos to them.
-func TestProxyDropsHellosFromTheWrongRole(t *testing.T) {
-	var p, addr = startProxy(t)
+func TestRelayDropsHellosFromTheWrongRole(t *testing.T) {
+	var p, addr = startRelay(t)
 	var victimID = uuid.Must(uuid.NewV4())
 	var server = connectUDP(t, addr, wire.RoleServer, uuid.Must(uuid.NewV4()))
 	var attacker = connectUDP(t, addr, wire.RoleClient, uuid.Must(uuid.NewV4()))
@@ -29,10 +29,10 @@ func TestProxyDropsHellosFromTheWrongRole(t *testing.T) {
 	expectNothing(t, victim, "a server's client hello at a client")
 }
 
-// TestProxySurvivesGarbage throws random datagrams and frames of every size
-// at the proxy, over UDP and TCP, and checks it still routes the stream.
-func TestProxySurvivesGarbage(t *testing.T) {
-	var p, addr = startProxy(t)
+// TestRelaySurvivesGarbage throws random datagrams and frames of every size
+// at the relay, over UDP and TCP, and checks it still routes the stream.
+func TestRelaySurvivesGarbage(t *testing.T) {
+	var p, addr = startRelay(t)
 	var server = connectUDP(t, addr, wire.RoleServer, uuid.Must(uuid.NewV4()))
 	var udpClient = connectUDP(t, addr, wire.RoleClient, uuid.Must(uuid.NewV4()))
 	var tcpClient = connectTCP(t, addr, wire.RoleClient, uuid.Must(uuid.NewV4()))

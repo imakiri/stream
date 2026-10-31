@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"net/netip"
-	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -19,13 +18,12 @@ import (
 	"github.com/imakiri/stream/src/frame"
 	"github.com/imakiri/stream/src/wire"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/net/proxy"
 )
 
 // packetBufferSize fits any wire packet and any datagram from OBS.
 const packetBufferSize = 1<<16 - 1
 
-// socketBufferSize is the kernel buffer of the UDP sockets to the proxy and
+// socketBufferSize is the kernel buffer of the UDP sockets to the relay and
 // to the player. The encoder sends the packets of an interleave group, 40 at
 // the default settings, back to back, and the receive buffer must take such
 // a burst whole: with 20 packets it dropped a few of every group even on
@@ -34,67 +32,57 @@ const packetBufferSize = 1<<16 - 1
 // net.core.rmem_max. The buffer adds no delay while the reader keeps up.
 const socketBufferSize = 1 << 20
 
-// ProxyNetwork is the transport between a peer and the proxy. The local side
+// RelayNetwork is the transport between a peer and the relay. The local side
 // towards OBS or the player is always UDP.
-type ProxyNetwork string
+type RelayNetwork string
 
 const (
-	ProxyNetworkUDP ProxyNetwork = "udp"
-	ProxyNetworkTCP ProxyNetwork = "tcp"
+	RelayNetworkUDP RelayNetwork = "udp"
+	RelayNetworkTCP RelayNetwork = "tcp"
 )
 
-// ProxyConfig says how to reach the proxy.
-type ProxyConfig struct {
-	Network    ProxyNetwork // "udp" (default) or "tcp"
-	SocksProxy string       // socks5 URL, e.g. socks5://127.0.0.1:2080; tcp only
-	Addr       string
-	Port       uint16
+// RelayConfig says how to reach the relay.
+type RelayConfig struct {
+	Network RelayNetwork // "udp" (default) or "tcp"
+	Addr    string
+	Port    uint16
+	Proxy   ProxyConfig // the way to the relay through a proxy, if any
 }
 
-func (cfg ProxyConfig) withDefaults() (ProxyConfig, *url.URL, error) {
+func (cfg RelayConfig) withDefaults() (RelayConfig, error) {
 	switch cfg.Network {
 	case "":
-		cfg.Network = ProxyNetworkUDP
-	case ProxyNetworkUDP, ProxyNetworkTCP:
+		cfg.Network = RelayNetworkUDP
+	case RelayNetworkUDP, RelayNetworkTCP:
 	default:
-		return cfg, nil, fmt.Errorf("unknown proxy network %q, want %q or %q", cfg.Network, ProxyNetworkUDP, ProxyNetworkTCP)
+		return cfg, fmt.Errorf("unknown relay network %q, want %q or %q", cfg.Network, RelayNetworkUDP, RelayNetworkTCP)
 	}
-	if cfg.SocksProxy == "" {
-		return cfg, nil, nil
-	}
-	if cfg.Network != ProxyNetworkTCP {
-		return cfg, nil, fmt.Errorf("socks proxy works only over %q, proxy network is %q", ProxyNetworkTCP, cfg.Network)
-	}
-	socks, err := url.Parse(cfg.SocksProxy)
-	if err != nil {
-		return cfg, nil, fmt.Errorf("failed to parse socks proxy url: %w", err)
-	}
-	return cfg, socks, nil
+	return cfg, cfg.Proxy.validate(cfg.Network)
 }
 
 const (
-	proxyHelloTimeout     = 2 * time.Second
-	proxyHelloUDPAttempts = 3 // UDP may lose the hello or its echo
+	relayHelloTimeout     = 2 * time.Second
+	relayHelloUDPAttempts = 3 // UDP may lose the hello or its echo
 )
 
-// KeepaliveInterval is how often a peer repeats its proxy hello, over UDP and
-// TCP. It must stay well below the proxy's peer timeout (proxy.PeerTimeout)
+// KeepaliveInterval is how often a peer repeats its relay hello, over UDP and
+// TCP. It must stay well below the relay's peer timeout (relay.PeerTimeout)
 // and below typical NAT and socks/tunnel UDP session timeouts (from about
 // 30 s).
 const KeepaliveInterval = 5 * time.Second
 
-// proxyLinkTiming is how a ProxyLink notices a broken connection and dials
+// relayLinkTiming is how a RelayLink notices a broken connection and dials
 // again; tests shorten it.
-type proxyLinkTiming struct {
+type relayLinkTiming struct {
 	keepaliveInterval time.Duration
-	// echoTimeout breaks a connection the proxy has not echoed a hello on
-	// for this long: the proxy is gone, or the network is.
+	// echoTimeout breaks a connection the relay has not echoed a hello on
+	// for this long: the relay is gone, or the network is.
 	echoTimeout    time.Duration
 	redialMinDelay time.Duration
 	redialMaxDelay time.Duration
 }
 
-var defaultProxyLinkTiming = proxyLinkTiming{
+var defaultRelayLinkTiming = relayLinkTiming{
 	keepaliveInterval: KeepaliveInterval,
 	echoTimeout:       3 * KeepaliveInterval,
 	redialMinDelay:    time.Second,
@@ -105,29 +93,29 @@ var defaultProxyLinkTiming = proxyLinkTiming{
 // repeats, e.g. while a firewall rejects the traffic.
 const udpReadErrorPause = 100 * time.Millisecond
 
-// ProxyLink is a connection to the proxy that outlives network pauses and
-// breaks: it registers as role with peerID, repeats the proxy hello every
-// KeepaliveInterval and dials again, with backoff, when the proxy stops
+// RelayLink is a connection to the relay that outlives network pauses and
+// breaks: it registers as role with peerID, repeats the relay hello every
+// KeepaliveInterval and dials again, with backoff, when the relay stops
 // echoing it or a TCP connection fails. Every Read and Write is one wire
 // packet.
 //
 // While the link is down, Write drops the packet and Read waits for the next
 // connection: the stream is real time, a late packet is of no use. Hello
-// echoes are taken by Read, so the link notices a dead proxy only while
+// echoes are taken by Read, so the link notices a dead relay only while
 // someone reads, which servers and clients always do.
-type ProxyLink struct {
-	cfg    ProxyConfig
-	socks  *url.URL
+type RelayLink struct {
+	cfg    RelayConfig
+	proxy  proxyDialer // nil for a direct connection
 	role   wire.Role
 	peerID uuid.UUID
 	hello  []byte
-	timing proxyLinkTiming
+	timing relayLinkTiming
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu      sync.Mutex
-	session *proxySession // nil while the link is down
+	session *relaySession // nil while the link is down
 	up      chan struct{} // closed when a session is published
 
 	// localIP is the local address of the last connection, see dialLocalIP;
@@ -138,8 +126,8 @@ type ProxyLink struct {
 	sendFailing atomic.Bool
 }
 
-// proxySession is one connection of a ProxyLink.
-type proxySession struct {
+// relaySession is one connection of a RelayLink.
+type relaySession struct {
 	conn             net.Conn
 	lastEchoUnixNano atomic.Int64
 	broken           chan struct{}
@@ -147,31 +135,35 @@ type proxySession struct {
 	breakReason      error
 }
 
-func (s *proxySession) fail(reason error) {
+func (s *relaySession) fail(reason error) {
 	s.breakOnce.Do(func() {
 		s.breakReason = reason
 		close(s.broken)
 	})
 }
 
-// DialProxy starts a ProxyLink and returns at once: the link connects in the
+// DialRelay starts a RelayLink and returns at once: the link connects in the
 // background and keeps connecting until ctx is done or it is closed. It
 // fails only on a bad config.
-func DialProxy(ctx context.Context, cfg ProxyConfig, role wire.Role, peerID uuid.UUID) (*ProxyLink, error) {
-	return dialProxyLink(ctx, cfg, role, peerID, defaultProxyLinkTiming)
+func DialRelay(ctx context.Context, cfg RelayConfig, role wire.Role, peerID uuid.UUID) (*RelayLink, error) {
+	return dialRelayLink(ctx, cfg, role, peerID, defaultRelayLinkTiming)
 }
 
-func dialProxyLink(ctx context.Context, cfg ProxyConfig, role wire.Role, peerID uuid.UUID, timing proxyLinkTiming) (*ProxyLink, error) {
-	cfg, socks, err := cfg.withDefaults()
+func dialRelayLink(ctx context.Context, cfg RelayConfig, role wire.Role, peerID uuid.UUID, timing relayLinkTiming) (*RelayLink, error) {
+	cfg, err := cfg.withDefaults()
 	if err != nil {
 		return nil, err
 	}
-	var l = &ProxyLink{
+	proxyDialer, err := cfg.Proxy.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var l = &RelayLink{
 		cfg:    cfg,
-		socks:  socks,
+		proxy:  proxyDialer,
 		role:   role,
 		peerID: peerID,
-		hello:  wire.MarshalProxyHello(role, peerID),
+		hello:  wire.MarshalRelayHello(role, peerID),
 		timing: timing,
 		up:     make(chan struct{}),
 	}
@@ -180,13 +172,17 @@ func dialProxyLink(ctx context.Context, cfg ProxyConfig, role wire.Role, peerID 
 	return l, nil
 }
 
-func (l *ProxyLink) addr() string {
-	return fmt.Sprintf("%s/%s", l.cfg.Network, net.JoinHostPort(l.cfg.Addr, strconv.Itoa(int(l.cfg.Port))))
+func (l *RelayLink) addr() string {
+	var addr = fmt.Sprintf("%s/%s", l.cfg.Network, net.JoinHostPort(l.cfg.Addr, strconv.Itoa(int(l.cfg.Port))))
+	if l.proxy != nil {
+		addr += " through the " + l.cfg.Proxy.String()
+	}
+	return addr
 }
 
 // keepConnected dials, watches the connection and dials again until the link
 // is closed.
-func (l *ProxyLink) keepConnected() {
+func (l *RelayLink) keepConnected() {
 	var delay = l.timing.redialMinDelay
 	for l.ctx.Err() == nil {
 		conn, err := l.dial()
@@ -194,7 +190,7 @@ func (l *ProxyLink) keepConnected() {
 			if l.ctx.Err() != nil {
 				return
 			}
-			log.Printf("failed to connect to proxy %s: %s; next attempt in %s", l.addr(), err, delay)
+			log.Printf("failed to connect to relay %s: %s; next attempt in %s", l.addr(), err, delay)
 			select {
 			case <-l.ctx.Done():
 				return
@@ -204,37 +200,37 @@ func (l *ProxyLink) keepConnected() {
 			continue
 		}
 		delay = l.timing.redialMinDelay
-		log.Printf("registered at proxy %s as %s %s", l.addr(), l.role, l.peerID)
+		log.Printf("registered at relay %s as %s %s", l.addr(), l.role, l.peerID)
 
-		var session = &proxySession{conn: conn, broken: make(chan struct{})}
+		var session = &relaySession{conn: conn, broken: make(chan struct{})}
 		session.lastEchoUnixNano.Store(time.Now().UnixNano())
 		l.publish(session)
 		var reason = l.watch(session)
 		l.unpublish()
 		_ = conn.Close()
 		if l.ctx.Err() == nil {
-			log.Printf("lost proxy %s: %s; reconnecting", l.addr(), reason)
+			log.Printf("lost relay %s: %s; reconnecting", l.addr(), reason)
 		}
 	}
 }
 
-func (l *ProxyLink) dial() (net.Conn, error) {
-	conn, err := dialProxyNetwork(l.ctx, l.cfg, l.socks, l.dialLocalIP())
+func (l *RelayLink) dial() (net.Conn, error) {
+	conn, err := dialRelayNetwork(l.ctx, l.cfg, l.proxy, l.dialLocalIP())
 	if err != nil {
 		return nil, err
 	}
 	var attempts = 1 // a retry after a timeout in the middle of a TCP frame would break the framing
-	if l.cfg.Network == ProxyNetworkUDP {
-		attempts = proxyHelloUDPAttempts
+	if l.cfg.Network == RelayNetworkUDP {
+		attempts = relayHelloUDPAttempts
 	}
-	// exchangeProxyHello may wait for seconds: let Close interrupt it
+	// exchangeRelayHello may wait for seconds: let Close interrupt it
 	var stop = context.AfterFunc(l.ctx, func() { _ = conn.Close() })
 	defer stop()
-	if err := exchangeProxyHello(conn, l.hello, attempts); err != nil {
+	if err := exchangeRelayHello(conn, l.hello, attempts); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("failed to register: %w", err)
 	}
-	if addr, ok := conn.LocalAddr().(interface{ AddrPort() netip.AddrPort }); ok && l.socks == nil {
+	if addr, ok := conn.LocalAddr().(interface{ AddrPort() netip.AddrPort }); ok && l.proxy == nil {
 		l.localIP = net.IP(addr.AddrPort().Addr().AsSlice())
 	}
 	return conn, nil
@@ -245,7 +241,7 @@ func (l *ProxyLink) dial() (net.Conn, error) {
 // up for a while (such as a WARP tunnel): the stream pauses until the VPN is
 // down rather than moving into it. On another network the address is gone and
 // the link dials from whatever the route gives.
-func (l *ProxyLink) dialLocalIP() net.IP {
+func (l *RelayLink) dialLocalIP() net.IP {
 	if l.localIP == nil {
 		return nil
 	}
@@ -262,7 +258,7 @@ func (l *ProxyLink) dialLocalIP() net.IP {
 }
 
 // watch sends the keepalive hellos of session and returns why it broke.
-func (l *ProxyLink) watch(session *proxySession) error {
+func (l *RelayLink) watch(session *relaySession) error {
 	var ticker = time.NewTicker(l.timing.keepaliveInterval)
 	defer ticker.Stop()
 	for {
@@ -283,21 +279,21 @@ func (l *ProxyLink) watch(session *proxySession) error {
 	}
 }
 
-func (l *ProxyLink) publish(session *proxySession) {
+func (l *RelayLink) publish(session *relaySession) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.session = session
 	close(l.up)
 }
 
-func (l *ProxyLink) unpublish() {
+func (l *RelayLink) unpublish() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.session = nil
 	l.up = make(chan struct{})
 }
 
-func (l *ProxyLink) currentSession() (*proxySession, <-chan struct{}) {
+func (l *RelayLink) currentSession() (*relaySession, <-chan struct{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.session, l.up
@@ -305,27 +301,27 @@ func (l *ProxyLink) currentSession() (*proxySession, <-chan struct{}) {
 
 // send writes packet to session. A failed TCP write breaks the session; a
 // failed UDP write does not, the socket works again once the network does.
-func (l *ProxyLink) send(session *proxySession, packet []byte) {
+func (l *RelayLink) send(session *relaySession, packet []byte) {
 	if _, err := session.conn.Write(packet); err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			return // keepConnected closed the session
 		}
-		if l.cfg.Network == ProxyNetworkTCP {
+		if l.cfg.Network == RelayNetworkTCP {
 			session.fail(err)
 		}
 		if l.sendFailing.CompareAndSwap(false, true) {
-			log.Printf("failed to send to proxy %s: %s; further failures are not logged until a send succeeds", l.addr(), err)
+			log.Printf("failed to send to relay %s: %s; further failures are not logged until a send succeeds", l.addr(), err)
 		}
 		return
 	}
 	if l.sendFailing.CompareAndSwap(true, false) {
-		log.Printf("sending to proxy %s again", l.addr())
+		log.Printf("sending to relay %s again", l.addr())
 	}
 }
 
 // Write sends p as one packet, or drops it while the link is down. It fails
 // only when the link is closed.
-func (l *ProxyLink) Write(p []byte) (int, error) {
+func (l *RelayLink) Write(p []byte) (int, error) {
 	if l.ctx.Err() != nil {
 		return 0, net.ErrClosed
 	}
@@ -338,7 +334,7 @@ func (l *ProxyLink) Write(p []byte) (int, error) {
 // Read reads the next packet that is not a hello echo, waiting through
 // reconnections. It fails with net.ErrClosed when the link is closed, and with
 // io.ErrShortBuffer, the packet dropped, when a TCP frame does not fit into p.
-func (l *ProxyLink) Read(p []byte) (int, error) {
+func (l *RelayLink) Read(p []byte) (int, error) {
 	for {
 		session, up := l.currentSession()
 		if session == nil {
@@ -357,13 +353,13 @@ func (l *ProxyLink) Read(p []byte) (int, error) {
 			return 0, err
 		case errors.Is(err, net.ErrClosed):
 			// keepConnected closed the session: wait for the next one
-		case err != nil && l.cfg.Network == ProxyNetworkTCP:
+		case err != nil && l.cfg.Network == RelayNetworkTCP:
 			session.fail(err)
 		case err != nil:
 			// A UDP socket reports ICMP errors and firewall rejects on
 			// read; the socket itself is fine.
 			time.Sleep(udpReadErrorPause)
-		case wire.PacketKind(p[:n]) == wire.KindProxyHello:
+		case wire.PacketKind(p[:n]) == wire.KindRelayHello:
 			session.lastEchoUnixNano.Store(time.Now().UnixNano())
 		default:
 			return n, nil
@@ -372,71 +368,70 @@ func (l *ProxyLink) Read(p []byte) (int, error) {
 }
 
 // Close closes the link; blocked Reads return net.ErrClosed.
-func (l *ProxyLink) Close() error {
+func (l *RelayLink) Close() error {
 	l.cancel()
 	if session, _ := l.currentSession(); session != nil {
 		_ = session.conn.Close()
 	}
+	if l.proxy != nil {
+		return l.proxy.Close()
+	}
 	return nil
 }
 
-// dialProxyNetwork connects to the proxy, from localIP if it is set; it is
-// not used with a socks proxy, which is reached over loopback or the LAN.
-func dialProxyNetwork(ctx context.Context, cfg ProxyConfig, socks *url.URL, localIP net.IP) (net.Conn, error) {
+// dialRelayNetwork connects to the relay, through proxyDialer if it is set
+// or else directly, from localIP if that is set.
+func dialRelayNetwork(ctx context.Context, cfg RelayConfig, proxyDialer proxyDialer, localIP net.IP) (net.Conn, error) {
 	var addr = net.JoinHostPort(cfg.Addr, strconv.Itoa(int(cfg.Port)))
-	var dialer = &net.Dialer{}
+	if proxyDialer != nil {
+		// No socket options here: the connection is to a local socks
+		// proxy or inside the tunnel's own network stack, so a buffer size or
+		// DSCP mark would not reach the packets that cross the internet.
+		conn, err := proxyDialer.DialContext(ctx, string(cfg.Network)+"4", addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to dial relay at %s/%s through the %s: %w", cfg.Network, addr, cfg.Proxy, err)
+		}
+		if cfg.Network == RelayNetworkTCP {
+			return frame.NewConn(conn), nil
+		}
+		return conn, nil
+	}
 
+	var dialer = &net.Dialer{}
 	switch cfg.Network {
-	case ProxyNetworkUDP:
+	case RelayNetworkUDP:
 		if localIP != nil {
 			dialer.LocalAddr = &net.UDPAddr{IP: localIP}
 		}
 		conn, err := dialer.DialContext(ctx, "udp4", addr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to dial proxy at udp/%s: %w", addr, err)
+			return nil, fmt.Errorf("failed to dial relay at udp/%s: %w", addr, err)
 		}
 		_ = conn.(*net.UDPConn).SetReadBuffer(socketBufferSize)
 		markRealTime(conn)
 		return conn, nil
-	default: // ProxyNetworkTCP
-		var contextDialer proxy.ContextDialer = dialer
-		if localIP != nil && socks == nil {
+	default: // RelayNetworkTCP
+		if localIP != nil {
 			dialer.LocalAddr = &net.TCPAddr{IP: localIP}
 		}
-		if socks != nil {
-			socksDialer, err := proxy.FromURL(socks, dialer)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create socks dialer for %s: %w", socks.Redacted(), err)
-			}
-			var ok bool
-			contextDialer, ok = socksDialer.(proxy.ContextDialer)
-			if !ok {
-				return nil, fmt.Errorf("socks dialer for %s does not support context", socks.Redacted())
-			}
-		}
-		conn, err := contextDialer.DialContext(ctx, "tcp4", addr)
+		conn, err := dialer.DialContext(ctx, "tcp4", addr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to dial proxy at tcp/%s: %w", addr, err)
+			return nil, fmt.Errorf("failed to dial relay at tcp/%s: %w", addr, err)
 		}
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.SetNoDelay(true)
-			// No SetReadBuffer here, unlike UDP: a fixed SO_RCVBUF turns off
-			// the kernel's window autotuning and caps TCP at buffer/RTT, e.g.
-			// about 2.4 Mbit/s with socketBufferSize at 92 ms.
-			if socks == nil {
-				// through a socks proxy the mark would only reach the local hop to it
-				markRealTime(conn)
-			}
-		}
+		_ = conn.(*net.TCPConn).SetNoDelay(true)
+		// No SetReadBuffer here, unlike UDP: a fixed SO_RCVBUF turns off
+		// the kernel's window autotuning and caps TCP at buffer/RTT, e.g.
+		// about 2.4 Mbit/s with socketBufferSize at 92 ms.
+		markRealTime(conn)
 		// TCP is a byte stream: frame the packets so the reader gets them whole.
 		return frame.NewConn(conn), nil
 	}
 }
 
-// exchangeProxyHello sends the hello and waits for the proxy to echo it. Other
-// packets before the echo are dropped: once the proxy has registered the peer
+// exchangeRelayHello sends the hello and waits for the relay to echo it. Other
+// packets before the echo are dropped: once the relay has registered the peer
 // it may route stream data to it ahead of the echo.
-func exchangeProxyHello(conn net.Conn, hello []byte, attempts int) error {
+func exchangeRelayHello(conn net.Conn, hello []byte, attempts int) error {
 	var buf = make([]byte, packetBufferSize)
 	defer conn.SetReadDeadline(time.Time{})
 	var err error
@@ -444,7 +439,7 @@ func exchangeProxyHello(conn net.Conn, hello []byte, attempts int) error {
 		if _, err = conn.Write(hello); err != nil {
 			return err
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(proxyHelloTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(relayHelloTimeout))
 		for {
 			var n int
 			n, err = conn.Read(buf)

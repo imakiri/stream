@@ -32,20 +32,20 @@ type DecoderConfig struct {
 }
 
 // ServerConfig configures the stream server: the source that takes the
-// stream from OBS and sends it to every client through the proxy.
+// stream from OBS and sends it to every client through the relay.
 type ServerConfig struct {
-	Proxy           ProxyConfig
+	Relay           RelayConfig
 	StreamInputPort uint16 // local UDP port OBS sends the mpegts stream to
 	PacingRate      uint64 // bits per second the data packets are spread at; 0: sent as the encoder hands them over
 	Fec             FecConfig
 	Encoder         EncoderConfig
 	Credentials     wire.Credentials
 	Verifier        wire.CertificateVerifier
-	OutputReporter  observer.Reporter // optional: speed of what goes to the proxy
+	OutputReporter  observer.Reporter // optional: speed of what goes to the relay
 }
 
 // Server takes the stream from OBS, adds FEC, seals it with the stream key
-// and sends one copy to the proxy, which hands it to every client. Clients
+// and sends one copy to the relay, which hands it to every client. Clients
 // get the stream key from the handshake.
 type Server struct {
 	cfg       ServerConfig
@@ -89,7 +89,7 @@ func (s *Server) Run(ctx context.Context) error {
 	defer streamInput.Close()
 	log.Printf("waiting for the stream from OBS at udp/%s", streamInput.LocalAddr())
 
-	link, err := DialProxy(ctx, s.cfg.Proxy, wire.RoleServer, s.cfg.Credentials.Certificate.ID)
+	link, err := DialRelay(ctx, s.cfg.Relay, wire.RoleServer, s.cfg.Credentials.Certificate.ID)
 	if err != nil {
 		return err
 	}
@@ -136,7 +136,7 @@ func (s *Server) readStreamInput(ctx context.Context, streamInput net.PacketConn
 	}
 }
 
-// sendStream seals every FEC packet into a data packet for the proxy, paced
+// sendStream seals every FEC packet into a data packet for the relay, paced
 // at cfg.PacingRate. The link drops packets while it is down and logs its
 // own failures, so a write error means it is closed.
 func (s *Server) sendStream(link io.Writer, encoderOut <-chan []byte) {
@@ -150,7 +150,7 @@ func (s *Server) sendStream(link io.Writer, encoderOut <-chan []byte) {
 	}
 }
 
-// answerHandshakes answers every client hello the proxy hands over.
+// answerHandshakes answers every client hello the relay hands over.
 func (s *Server) answerHandshakes(link io.ReadWriter) {
 	var buf = make([]byte, packetBufferSize)
 	for {
@@ -159,7 +159,7 @@ func (s *Server) answerHandshakes(link io.ReadWriter) {
 			return
 		}
 		if err != nil {
-			log.Printf("failed to read from proxy: %s", err)
+			log.Printf("failed to read from relay: %s", err)
 			continue
 		}
 		if wire.PacketKind(buf[:n]) != wire.KindClientHello {

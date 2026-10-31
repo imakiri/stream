@@ -17,16 +17,16 @@ import (
 )
 
 // ClientConfig configures a client: a viewer that gets the stream from the
-// server through the proxy and hands it to a local player such as ffplay.
+// server through the relay and hands it to a local player such as ffplay.
 type ClientConfig struct {
-	Proxy         ProxyConfig
+	Relay         RelayConfig
 	PlayerPort    uint16 // local UDP port the player reads the mpegts stream from
 	Fec           FecConfig
 	Decoder       DecoderConfig
 	Credentials   wire.Credentials
 	Verifier      wire.CertificateVerifier
 	ServerID      uuid.UUID         // the server's certificate ID; no other certificate may serve the stream
-	InputReporter observer.Reporter // optional: speed of what comes from the proxy
+	InputReporter observer.Reporter // optional: speed of what comes from the relay
 }
 
 const (
@@ -95,7 +95,7 @@ func (c *Client) Run(ctx context.Context) error {
 	_ = player.(*net.UDPConn).SetWriteBuffer(socketBufferSize)
 	log.Printf("sending the stream to the player at udp/%s", player.RemoteAddr())
 
-	link, err := DialProxy(ctx, c.cfg.Proxy, wire.RoleClient, c.cfg.Credentials.Certificate.ID)
+	link, err := DialRelay(ctx, c.cfg.Relay, wire.RoleClient, c.cfg.Credentials.Certificate.ID)
 	if err != nil {
 		return err
 	}
@@ -162,7 +162,7 @@ func (c *Client) keepHandshake(ctx context.Context, link io.Writer) {
 	}
 }
 
-// receive takes server hellos and data packets from the proxy.
+// receive takes server hellos and data packets from the relay.
 // A handshake is logged only when it brings another stream key: while the
 // server sends no data the client handshakes every few seconds and gets the
 // same key, and reportStream tells that once.
@@ -176,7 +176,7 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 			return
 		}
 		if err != nil {
-			log.Printf("failed to read from proxy: %s", err)
+			log.Printf("failed to read from relay: %s", err)
 			continue
 		}
 		switch wire.PacketKind(buf[:n]) {

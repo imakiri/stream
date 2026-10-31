@@ -212,13 +212,13 @@ func TestHandshakeRejects(t *testing.T) {
 	})
 }
 
-func TestProxyHelloRoundTrip(t *testing.T) {
+func TestRelayHelloRoundTrip(t *testing.T) {
 	var id = uuid.Must(uuid.NewV4())
-	role, parsed, err := ParseProxyHello(MarshalProxyHello(RoleServer, id))
+	role, parsed, err := ParseRelayHello(MarshalRelayHello(RoleServer, id))
 	if err != nil || role != RoleServer || parsed != id {
 		t.Fatalf("%v %v %v", role, parsed, err)
 	}
-	if _, _, err := ParseProxyHello(MarshalProxyHello(Role(9), id)); err == nil {
+	if _, _, err := ParseRelayHello(MarshalRelayHello(Role(9), id)); err == nil {
 		t.Fatal("want error for unknown role")
 	}
 }

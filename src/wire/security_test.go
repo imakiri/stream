@@ -13,7 +13,7 @@ import (
 )
 
 // Security properties of the data stream and the handshake: what an attacker
-// on the path (or at the proxy) can and cannot do with the packets it sees.
+// on the path (or at the relay) can and cannot do with the packets it sees.
 
 // newStreamPair returns a sealer and an opener of one fresh stream key.
 func newStreamPair(t testing.TB) (*AESGCMStreamSealer, *AESGCMStreamOpener) {
@@ -170,7 +170,7 @@ func TestServerHelloRejectsAnyChangedByte(t *testing.T) {
 }
 
 // TestHandshakeRejectsStolenCertificate uses a real certificate, which is
-// public (it travels in clear through the proxy), with a key of the attacker:
+// public (it travels in clear through the relay), with a key of the attacker:
 // without the certified private key neither a client nor the server can be
 // impersonated.
 func TestHandshakeRejectsStolenCertificate(t *testing.T) {
@@ -266,10 +266,10 @@ func TestEnrollmentRejectsChangedBytes(t *testing.T) {
 // anything is authenticated; they must fail cleanly, never panic. The seeds
 // run with go test; go test -fuzz=FuzzX ./src/wire explores further.
 
-func FuzzParseProxyHello(f *testing.F) {
-	f.Add(MarshalProxyHello(RoleClient, uuid.Must(uuid.NewV4())))
+func FuzzParseRelayHello(f *testing.F) {
+	f.Add(MarshalRelayHello(RoleClient, uuid.Must(uuid.NewV4())))
 	f.Fuzz(func(t *testing.T, packet []byte) {
-		_, _, _ = ParseProxyHello(packet)
+		_, _, _ = ParseRelayHello(packet)
 		_ = PacketKind(packet)
 	})
 }

@@ -1,4 +1,4 @@
-package proxy
+package relay
 
 import (
 	"bytes"
@@ -32,7 +32,7 @@ func freeAddr(t *testing.T) string {
 	return ""
 }
 
-func startProxy(t *testing.T) (*Proxy, string) {
+func startRelay(t *testing.T) (*Relay, string) {
 	t.Helper()
 	var addr = freeAddr(t)
 	var p = New(addr, liveoutput.New(io.Discard))
@@ -52,14 +52,14 @@ func connectUDP(t *testing.T, addr string, role wire.Role, id uuid.UUID) net.Con
 	}
 	t.Cleanup(func() { conn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	var hello = wire.MarshalProxyHello(role, id)
+	var hello = wire.MarshalRelayHello(role, id)
 	if _, err := conn.Write(hello); err != nil {
 		t.Fatal(err)
 	}
 	var buf = make([]byte, packetBufferSize)
 	n, err := conn.Read(buf)
 	if err != nil || !bytes.Equal(buf[:n], hello) {
-		t.Fatalf("udp proxy hello: %q, %v", buf[:n], err)
+		t.Fatalf("udp relay hello: %q, %v", buf[:n], err)
 	}
 	return conn
 }
@@ -74,19 +74,19 @@ func connectTCP(t *testing.T, addr string, role wire.Role, id uuid.UUID) net.Con
 	t.Cleanup(func() { raw.Close() })
 	_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
 	var conn = frame.NewConn(raw)
-	var hello = wire.MarshalProxyHello(role, id)
+	var hello = wire.MarshalRelayHello(role, id)
 	if _, err := conn.Write(hello); err != nil {
 		t.Fatal(err)
 	}
 	var buf = make([]byte, packetBufferSize)
 	n, err := conn.Read(buf)
 	if err != nil || !bytes.Equal(buf[:n], hello) {
-		t.Fatalf("tcp proxy hello: %q, %v", buf[:n], err)
+		t.Fatalf("tcp relay hello: %q, %v", buf[:n], err)
 	}
 	return conn
 }
 
-func waitPeers(t *testing.T, p *Proxy, count int) {
+func waitPeers(t *testing.T, p *Relay, count int) {
 	t.Helper()
 	for i := 0; len(p.appendPeers(nil)) < count; i++ {
 		if i > 100 {
@@ -127,10 +127,10 @@ func expectNothing(t *testing.T, conn net.Conn, what string) {
 	}
 }
 
-// TestProxyRoutesBetweenServerAndClients puts the server on UDP and two
+// TestRelayRoutesBetweenServerAndClients puts the server on UDP and two
 // clients on UDP and TCP, and checks every routing rule.
-func TestProxyRoutesBetweenServerAndClients(t *testing.T) {
-	var p, addr = startProxy(t)
+func TestRelayRoutesBetweenServerAndClients(t *testing.T) {
+	var p, addr = startRelay(t)
 	var udpClientID, tcpClientID = uuid.Must(uuid.NewV4()), uuid.Must(uuid.NewV4())
 	var server = connectUDP(t, addr, wire.RoleServer, uuid.Must(uuid.NewV4()))
 	var udpClient = connectUDP(t, addr, wire.RoleClient, udpClientID)
@@ -171,11 +171,11 @@ func TestProxyRoutesBetweenServerAndClients(t *testing.T) {
 	expectNothing(t, server, "client data at server")
 }
 
-// TestProxyFollowsUDPPeerToNewPort repeats a client's proxy hello from another
+// TestRelayFollowsUDPPeerToNewPort repeats a client's relay hello from another
 // socket, as after a NAT rebinding or a tunnel exit change, and checks that
 // packets for the client go to the new address from then on.
-func TestProxyFollowsUDPPeerToNewPort(t *testing.T) {
-	var p, addr = startProxy(t)
+func TestRelayFollowsUDPPeerToNewPort(t *testing.T) {
+	var p, addr = startRelay(t)
 	var clientID = uuid.Must(uuid.NewV4())
 	var oldConn = connectUDP(t, addr, wire.RoleClient, clientID)
 	var server = connectUDP(t, addr, wire.RoleServer, uuid.Must(uuid.NewV4()))
@@ -190,9 +190,9 @@ func TestProxyFollowsUDPPeerToNewPort(t *testing.T) {
 	expectNothing(t, oldConn, "data at old address")
 }
 
-// TestProxyDropsSilentUDPPeer checks that a UDP peer without keepalives is
+// TestRelayDropsSilentUDPPeer checks that a UDP peer without keepalives is
 // removed after the timeout, while one that keeps saying hello stays.
-func TestProxyDropsSilentUDPPeer(t *testing.T) {
+func TestRelayDropsSilentUDPPeer(t *testing.T) {
 	var addr = freeAddr(t)
 	var p = New(addr, liveoutput.New(io.Discard))
 	p.peerTimeout = 1500 * time.Millisecond
@@ -207,7 +207,7 @@ func TestProxyDropsSilentUDPPeer(t *testing.T) {
 
 	for range 6 {
 		time.Sleep(500 * time.Millisecond)
-		if _, err := alive.Write(wire.MarshalProxyHello(wire.RoleClient, aliveID)); err != nil {
+		if _, err := alive.Write(wire.MarshalRelayHello(wire.RoleClient, aliveID)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -217,10 +217,10 @@ func TestProxyDropsSilentUDPPeer(t *testing.T) {
 	}
 }
 
-// TestProxyKeepsOneServer checks that a newly registered server replaces the
+// TestRelayKeepsOneServer checks that a newly registered server replaces the
 // previous one.
-func TestProxyKeepsOneServer(t *testing.T) {
-	var p, addr = startProxy(t)
+func TestRelayKeepsOneServer(t *testing.T) {
+	var p, addr = startRelay(t)
 	connectUDP(t, addr, wire.RoleServer, uuid.Must(uuid.NewV4()))
 	var newServerID = uuid.Must(uuid.NewV4())
 	connectTCP(t, addr, wire.RoleServer, newServerID)
@@ -232,22 +232,22 @@ func TestProxyKeepsOneServer(t *testing.T) {
 	}
 }
 
-// TestProxyEchoesTCPKeepalive checks that a repeated hello over TCP comes
+// TestRelayEchoesTCPKeepalive checks that a repeated hello over TCP comes
 // back: the peer checks its link by the echoes.
-func TestProxyEchoesTCPKeepalive(t *testing.T) {
-	_, addr := startProxy(t)
+func TestRelayEchoesTCPKeepalive(t *testing.T) {
+	_, addr := startRelay(t)
 	var id = uuid.Must(uuid.NewV4())
 	var conn = connectTCP(t, addr, wire.RoleClient, id)
-	var hello = wire.MarshalProxyHello(wire.RoleClient, id)
+	var hello = wire.MarshalRelayHello(wire.RoleClient, id)
 	if _, err := conn.Write(hello); err != nil {
 		t.Fatal(err)
 	}
 	expectPacket(t, conn, hello, "keepalive echo")
 }
 
-// TestProxyDropsSilentTCPPeer checks that a TCP peer without keepalives is
+// TestRelayDropsSilentTCPPeer checks that a TCP peer without keepalives is
 // disconnected after the timeout.
-func TestProxyDropsSilentTCPPeer(t *testing.T) {
+func TestRelayDropsSilentTCPPeer(t *testing.T) {
 	var addr = freeAddr(t)
 	var p = New(addr, liveoutput.New(io.Discard))
 	p.peerTimeout = 500 * time.Millisecond

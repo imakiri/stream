@@ -1,5 +1,5 @@
 // Command client is a viewer: it gets the stream from the server through the
-// proxy, restores it with FEC and sends it to a local player over UDP, e.g.
+// relay, restores it with FEC and sends it to a local player over UDP, e.g.
 //
 //	ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop -sync ext "udp://127.0.0.1:25566?overrun_nonfatal=1"
 //

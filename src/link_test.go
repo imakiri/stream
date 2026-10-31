@@ -12,10 +12,10 @@ import (
 	"github.com/imakiri/stream/src/wire"
 )
 
-// TestProxyLinkRedialsWhenProxyStopsEchoing runs a fake UDP proxy that stops
+// TestRelayLinkRedialsWhenRelayStopsEchoing runs a fake UDP relay that stops
 // echoing the hellos, and checks the link dials again, from a new socket, and
 // reads packets there.
-func TestProxyLinkRedialsWhenProxyStopsEchoing(t *testing.T) {
+func TestRelayLinkRedialsWhenRelayStopsEchoing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	fake, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -33,7 +33,7 @@ func TestProxyLinkRedialsWhenProxyStopsEchoing(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if wire.PacketKind(buf[:n]) != wire.KindProxyHello {
+			if wire.PacketKind(buf[:n]) != wire.KindRelayHello {
 				continue
 			}
 			helloFrom <- addr
@@ -44,7 +44,7 @@ func TestProxyLinkRedialsWhenProxyStopsEchoing(t *testing.T) {
 	}()
 
 	var port = uint16(fake.LocalAddr().(*net.UDPAddr).Port)
-	link, err := dialProxyLink(ctx, ProxyConfig{Addr: "127.0.0.1", Port: port}, wire.RoleClient, uuid.Must(uuid.NewV4()), proxyLinkTiming{
+	link, err := dialRelayLink(ctx, RelayConfig{Addr: "127.0.0.1", Port: port}, wire.RoleClient, uuid.Must(uuid.NewV4()), relayLinkTiming{
 		keepaliveInterval: 50 * time.Millisecond,
 		echoTimeout:       200 * time.Millisecond,
 		redialMinDelay:    50 * time.Millisecond,
@@ -54,7 +54,7 @@ func TestProxyLinkRedialsWhenProxyStopsEchoing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer link.Close()
-	// Read takes the echoes, which is how the link sees the proxy alive.
+	// Read takes the echoes, which is how the link sees the relay alive.
 	var packets = make(chan []byte, 10)
 	go func() {
 		var buf = make([]byte, packetBufferSize)
@@ -111,11 +111,11 @@ func TestProxyLinkRedialsWhenProxyStopsEchoing(t *testing.T) {
 	}
 }
 
-// TestProxyLinkDropsWritesWhileDown checks that Write neither fails nor
-// blocks while there is no proxy, and fails once the link is closed.
-func TestProxyLinkDropsWritesWhileDown(t *testing.T) {
-	addr, port := freeProxyAddr(t)
-	link, err := DialProxy(context.Background(), ProxyConfig{Network: ProxyNetworkTCP, Addr: addr, Port: port}, wire.RoleServer, uuid.Must(uuid.NewV4()))
+// TestRelayLinkDropsWritesWhileDown checks that Write neither fails nor
+// blocks while there is no relay, and fails once the link is closed.
+func TestRelayLinkDropsWritesWhileDown(t *testing.T) {
+	addr, port := freeRelayAddr(t)
+	link, err := DialRelay(context.Background(), RelayConfig{Network: RelayNetworkTCP, Addr: addr, Port: port}, wire.RoleServer, uuid.Must(uuid.NewV4()))
 	if err != nil {
 		t.Fatal(err)
 	}

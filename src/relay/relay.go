@@ -1,7 +1,7 @@
-// Package proxy relays wire packets between the stream server and its
+// Package relay forwards wire packets between the stream server and its
 // clients. It sees only the clear routing fields of the packets: the
 // handshake and the stream are end-to-end between server and clients.
-package proxy
+package relay
 
 import (
 	"errors"
@@ -24,18 +24,18 @@ const packetBufferSize = 1<<16 - 1
 
 const tcpWriteTimeout = time.Second
 
-// PeerTimeout drops a peer that sent nothing, not even a keepalive proxy
+// PeerTimeout drops a peer that sent nothing, not even a keepalive relay
 // hello (src.KeepaliveInterval), for this long, over UDP and TCP. A TCP peer
 // is also dropped when its connection closes.
 const PeerTimeout = 30 * time.Second
 
 // unknownPeerLogInterval limits the log of packets from unknown UDP peers: a
-// server whose registration the proxy lost, e.g. after a proxy restart, sends
+// server whose registration the relay lost, e.g. after a relay restart, sends
 // a thousand data packets a second until its next hello.
 const unknownPeerLogInterval = 5 * time.Second
 
 // Peer is one connected server or client. A peer is reached either over UDP,
-// by the address its last proxy hello came from, or over TCP, through its
+// by the address its last relay hello came from, or over TCP, through its
 // framed connection.
 type Peer struct {
 	role    wire.Role
@@ -68,7 +68,7 @@ func (p *Peer) close() {
 	}
 }
 
-// Proxy routes packets between one server and its clients over UDP and TCP
+// Relay routes packets between one server and its clients over UDP and TCP
 // at the same address, whichever transport each peer connected with:
 //
 //	client hello  client -> the server
@@ -76,7 +76,7 @@ func (p *Peer) close() {
 //	data          server -> every client
 //
 // Anything else, and data from clients, is dropped.
-type Proxy struct {
+type Relay struct {
 	mu     sync.RWMutex
 	peers  []*Peer
 	closed bool // set by Close under mu, so no peer is added after Close took its snapshot
@@ -96,14 +96,14 @@ type Proxy struct {
 	totalSent           atomic.Uint64
 }
 
-func New(addr string, speedOutput *liveoutput.Output) *Proxy {
-	return &Proxy{addr: addr, speedOutput: speedOutput, peerTimeout: PeerTimeout}
+func New(addr string, speedOutput *liveoutput.Output) *Relay {
+	return &Relay{addr: addr, speedOutput: speedOutput, peerTimeout: PeerTimeout}
 }
 
 // addPeer registers the peer, replacing a previous connection with the same
 // ID; a new server also replaces any other server. It returns false, and
-// closes the peer, if the proxy is closing.
-func (p *Proxy) addPeer(peer *Peer) bool {
+// closes the peer, if the relay is closing.
+func (p *Relay) addPeer(peer *Peer) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -129,7 +129,7 @@ func (p *Proxy) addPeer(peer *Peer) bool {
 
 // removePeer removes this very peer; it does nothing if the peer has already
 // been replaced by a newer connection.
-func (p *Proxy) removePeer(peer *Peer) {
+func (p *Relay) removePeer(peer *Peer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var i = slices.Index(p.peers, peer)
@@ -141,13 +141,13 @@ func (p *Proxy) removePeer(peer *Peer) {
 	log.Printf("removed %s", peer)
 }
 
-func (p *Proxy) appendPeers(dst []*Peer) []*Peer {
+func (p *Relay) appendPeers(dst []*Peer) []*Peer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return append(dst, p.peers...)
 }
 
-func (p *Proxy) findPeer(match func(*Peer) bool) *Peer {
+func (p *Relay) findPeer(match func(*Peer) bool) *Peer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, peer := range p.peers {
@@ -158,12 +158,12 @@ func (p *Proxy) findPeer(match func(*Peer) bool) *Peer {
 	return nil
 }
 
-func (p *Proxy) findUDPPeer(addr *net.UDPAddr) *Peer {
+func (p *Relay) findUDPPeer(addr *net.UDPAddr) *Peer {
 	var addrPort = addr.AddrPort()
 	return p.findPeer(func(peer *Peer) bool { return peer.udpAddr != nil && peer.udpAddr.AddrPort() == addrPort })
 }
 
-func (p *Proxy) sendToPeer(peer *Peer, packet []byte) error {
+func (p *Relay) sendToPeer(peer *Peer, packet []byte) error {
 	if peer.tcpConn != nil {
 		_ = peer.tcpConn.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
 		_, err := peer.tcpConn.Write(packet)
@@ -176,7 +176,7 @@ func (p *Proxy) sendToPeer(peer *Peer, packet []byte) error {
 	return err
 }
 
-func (p *Proxy) send(peer *Peer, packet []byte) {
+func (p *Relay) send(peer *Peer, packet []byte) {
 	if err := p.sendToPeer(peer, packet); err != nil {
 		log.Printf("failed to send to %s: %s", peer, err)
 		if peer.tcpConn != nil {
@@ -189,10 +189,10 @@ func (p *Proxy) send(peer *Peer, packet []byte) {
 
 // route forwards a packet of from by its kind. A TCP peer that fails to take
 // a packet is dropped; UDP has no connection to drop.
-func (p *Proxy) route(from *Peer, packet []byte, peers []*Peer) []*Peer {
+func (p *Relay) route(from *Peer, packet []byte, peers []*Peer) []*Peer {
 	p.totalReceived.Add(uint64(len(packet)))
 	switch wire.PacketKind(packet) {
-	case wire.KindProxyHello:
+	case wire.KindRelayHello:
 		// A keepalive over TCP: echo it, the peer checks the link by the
 		// echoes. UDP hellos never get here, serveUDP answers them.
 		p.send(from, packet)
@@ -228,7 +228,7 @@ func (p *Proxy) route(from *Peer, packet []byte, peers []*Peer) []*Peer {
 	return peers
 }
 
-func (p *Proxy) serveUDP() {
+func (p *Relay) serveUDP() {
 	var buf = make([]byte, packetBufferSize)
 	var peers []*Peer
 	var unknownPeerLoggedAt time.Time
@@ -243,10 +243,10 @@ func (p *Proxy) serveUDP() {
 			continue
 		}
 
-		if wire.PacketKind(buf[:n]) == wire.KindProxyHello {
-			role, peerID, err := wire.ParseProxyHello(buf[:n])
+		if wire.PacketKind(buf[:n]) == wire.KindRelayHello {
+			role, peerID, err := wire.ParseRelayHello(buf[:n])
 			if err != nil {
-				log.Printf("bad proxy hello from udp/%s: %s", addr, err)
+				log.Printf("bad relay hello from udp/%s: %s", addr, err)
 				continue
 			}
 			// The hello is both the registration and the keepalive: the same
@@ -261,7 +261,7 @@ func (p *Proxy) serveUDP() {
 				}
 			}
 			if _, err := p.udpConn.WriteToUDP(buf[:n], addr); err != nil {
-				log.Printf("failed to answer proxy hello from udp/%s: %s", addr, err)
+				log.Printf("failed to answer relay hello from udp/%s: %s", addr, err)
 			}
 			continue
 		}
@@ -280,7 +280,7 @@ func (p *Proxy) serveUDP() {
 	}
 }
 
-func (p *Proxy) serveTCP() {
+func (p *Relay) serveTCP() {
 	for {
 		conn, err := p.tcpListener.Accept()
 		if err != nil {
@@ -294,8 +294,8 @@ func (p *Proxy) serveTCP() {
 	}
 }
 
-// serveTCPConn takes the first frame of a TCP peer as its proxy hello.
-func (p *Proxy) serveTCPConn(conn net.Conn) {
+// serveTCPConn takes the first frame of a TCP peer as its relay hello.
+func (p *Relay) serveTCPConn(conn net.Conn) {
 	var addr = conn.RemoteAddr()
 	var framed = frame.NewConn(conn)
 	var buf = make([]byte, packetBufferSize)
@@ -304,18 +304,18 @@ func (p *Proxy) serveTCPConn(conn net.Conn) {
 	n, err := framed.Read(buf)
 	if err != nil {
 		_ = conn.Close()
-		log.Printf("failed proxy hello from tcp/%s: %s", addr, err)
+		log.Printf("failed relay hello from tcp/%s: %s", addr, err)
 		return
 	}
-	role, peerID, err := wire.ParseProxyHello(buf[:n])
+	role, peerID, err := wire.ParseRelayHello(buf[:n])
 	if err != nil {
 		_ = conn.Close()
-		log.Printf("failed proxy hello from tcp/%s: %s", addr, err)
+		log.Printf("failed relay hello from tcp/%s: %s", addr, err)
 		return
 	}
 	if _, err := framed.Write(buf[:n]); err != nil {
 		_ = conn.Close()
-		log.Printf("failed to answer proxy hello from tcp/%s: %s", addr, err)
+		log.Printf("failed to answer relay hello from tcp/%s: %s", addr, err)
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -342,7 +342,7 @@ func (p *Proxy) serveTCPConn(conn net.Conn) {
 
 // expireUDPPeers drops UDP peers that went silent for peerTimeout; a silent
 // TCP peer runs into the read deadline in serveTCPConn.
-func (p *Proxy) expireUDPPeers() {
+func (p *Relay) expireUDPPeers() {
 	var ticker = time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var peers []*Peer
@@ -366,7 +366,7 @@ func (p *Proxy) expireUDPPeers() {
 	}
 }
 
-func (p *Proxy) reportSpeed() {
+func (p *Relay) reportSpeed() {
 	var ticker = time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -386,10 +386,10 @@ func (p *Proxy) reportSpeed() {
 	}
 }
 
-// Serve starts listening on UDP and TCP at the proxy address.
-func (p *Proxy) Serve() error {
+// Serve starts listening on UDP and TCP at the relay address.
+func (p *Relay) Serve() error {
 	if p.done != nil {
-		return errors.New("proxy can be started only once")
+		return errors.New("relay can be started only once")
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp4", p.addr)
@@ -418,7 +418,7 @@ func (p *Proxy) Serve() error {
 	return nil
 }
 
-func (p *Proxy) Close() {
+func (p *Relay) Close() {
 	close(p.done)
 	_ = p.udpConn.Close()
 	_ = p.tcpListener.Close()

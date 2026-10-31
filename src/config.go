@@ -2,6 +2,8 @@ package src
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/pelletier/go-toml"
@@ -11,15 +13,39 @@ import (
 // cmd/client/client.example.cfg. They hold the network and FEC settings only:
 // keys and certificates are files in the key directory, see keystore.go.
 
-type proxyConfigFile struct {
-	Addr       string `toml:"addr"`
-	Port       uint16 `toml:"port"`
-	Network    string `toml:"network"`     // "udp" (default) or "tcp"
-	SocksProxy string `toml:"socks_proxy"` // tcp only, e.g. socks5://127.0.0.1:2080
+type relayConfigFile struct {
+	Addr    string `toml:"addr"`
+	Port    uint16 `toml:"port"`
+	Network string `toml:"network"` // "udp" (default) or "tcp"
 }
 
-func (f proxyConfigFile) config() ProxyConfig {
-	return ProxyConfig{Network: ProxyNetwork(f.Network), SocksProxy: f.SocksProxy, Addr: f.Addr, Port: f.Port}
+// proxyConfigFile is the [proxy] section: [proxy.socks5] or
+// [proxy.amneziawg], at most one. TOML has no union types, so each kind is
+// a sub-table and an absent one decodes to nil.
+type proxyConfigFile struct {
+	Socks5 *struct {
+		URL string `toml:"url"`
+	} `toml:"socks5"`
+	AmneziaWG *struct {
+		Config string `toml:"config"` // path, relative to the directory of the config file
+	} `toml:"amneziawg"`
+}
+
+// relayConfig makes the RelayConfig of the [relay] and [proxy] sections of
+// the config file at configPath.
+func relayConfig(relay relayConfigFile, proxy proxyConfigFile, configPath string) RelayConfig {
+	var cfg = RelayConfig{Network: RelayNetwork(relay.Network), Addr: relay.Addr, Port: relay.Port}
+	if proxy.Socks5 != nil {
+		cfg.Proxy.Socks5 = &Socks5ProxyConfig{URL: proxy.Socks5.URL}
+	}
+	if proxy.AmneziaWG != nil {
+		var path = proxy.AmneziaWG.Config
+		if path != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(filepath.Dir(configPath), path)
+		}
+		cfg.Proxy.AmneziaWG = &AmneziaWGProxyConfig{ConfigPath: path}
+	}
+	return cfg
 }
 
 type fecConfigFile struct {
@@ -31,12 +57,18 @@ func (f fecConfigFile) config() FecConfig {
 	return FecConfig{DataParts: f.DataParts, TotalParts: f.TotalParts}
 }
 
+// loadConfigFile decodes the config at path into dst. Unknown keys are an
+// error, so a typo or a section of an older layout is not silently ignored.
 func loadConfigFile(path string, dst any) error {
-	tree, err := toml.LoadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("failed to read config %s: %w", path, err)
 	}
-	if err := tree.Unmarshal(dst); err != nil {
+	defer file.Close()
+	if err := toml.NewDecoder(file).Strict(true).Decode(dst); err != nil {
+		if tree, treeErr := toml.LoadFile(path); treeErr == nil && tree.Has("proxy.addr") {
+			return fmt.Errorf("failed to parse config %s: the [proxy] section with the relay address is now called [relay]; [proxy] is for a socks5 or amneziawg proxy, see the example config", path)
+		}
 		return fmt.Errorf("failed to parse config %s: %w", path, err)
 	}
 	return nil
@@ -44,6 +76,7 @@ func loadConfigFile(path string, dst any) error {
 
 func LoadServerConfig(path string) (ServerConfig, error) {
 	var f struct {
+		Relay       relayConfigFile `toml:"relay"`
 		Proxy       proxyConfigFile `toml:"proxy"`
 		StreamInput struct {
 			Port uint16 `toml:"port"`
@@ -65,7 +98,7 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 		pacingRate = *f.Pacing.RateMbit * 1_000_000
 	}
 	return ServerConfig{
-		Proxy:           f.Proxy.config(),
+		Relay:           relayConfig(f.Relay, f.Proxy, path),
 		StreamInputPort: f.StreamInput.Port,
 		PacingRate:      pacingRate,
 		Fec:             f.Fec.config(),
@@ -78,6 +111,7 @@ func LoadServerConfig(path string) (ServerConfig, error) {
 
 func LoadClientConfig(path string) (ClientConfig, error) {
 	var f struct {
+		Relay  relayConfigFile `toml:"relay"`
 		Proxy  proxyConfigFile `toml:"proxy"`
 		Player struct {
 			Port uint16 `toml:"port"`
@@ -92,7 +126,7 @@ func LoadClientConfig(path string) (ClientConfig, error) {
 		return ClientConfig{}, err
 	}
 	return ClientConfig{
-		Proxy:      f.Proxy.config(),
+		Relay:      relayConfig(f.Relay, f.Proxy, path),
 		PlayerPort: f.Player.Port,
 		Fec:        f.Fec.config(),
 		Decoder: DecoderConfig{
