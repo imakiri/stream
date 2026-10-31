@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid/v5"
-	"github.com/gosuri/uilive"
 	"github.com/imakiri/stream/src/frame"
+	"github.com/imakiri/stream/src/liveoutput"
 	"github.com/imakiri/stream/src/wire"
 )
 
@@ -89,14 +89,14 @@ type Proxy struct {
 	peerTimeout time.Duration
 
 	addr                string
-	speedOutput         *uilive.Writer
+	speedOutput         *liveoutput.Output
 	totalReceivedBefore uint64
 	totalSentBefore     uint64
 	totalReceived       atomic.Uint64
 	totalSent           atomic.Uint64
 }
 
-func New(addr string, speedOutput *uilive.Writer) *Proxy {
+func New(addr string, speedOutput *liveoutput.Output) *Proxy {
 	return &Proxy{addr: addr, speedOutput: speedOutput, peerTimeout: PeerTimeout}
 }
 
@@ -377,10 +377,8 @@ func (p *Proxy) reportSpeed() {
 			var totalReceived = p.totalReceived.Load()
 			var totalSent = p.totalSent.Load()
 
-			if totalReceived > p.totalReceivedBefore {
-				_, _ = fmt.Fprintf(p.speedOutput.Newline(), "incoming speed: %6d KBit/sec, outgoing speed: %6d KBit/sec, transmited: %6d MB\n",
-					8*(totalReceived-p.totalReceivedBefore)/(1<<10), 8*(totalSent-p.totalSentBefore)/(1<<10), totalReceived/(1<<20))
-			}
+			p.speedOutput.SetStatus("speed", fmt.Sprintf("in %6d kbit/s, out %6d kbit/s, received %6d MB",
+				8*(totalReceived-p.totalReceivedBefore)/(1<<10), 8*(totalSent-p.totalSentBefore)/(1<<10), totalReceived/(1<<20)))
 
 			p.totalReceivedBefore = totalReceived
 			p.totalSentBefore = totalSent

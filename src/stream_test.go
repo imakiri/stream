@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -12,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid/v5"
-	"github.com/gosuri/uilive"
+	"github.com/imakiri/stream/src/liveoutput"
 	"github.com/imakiri/stream/src/proxy"
 	"github.com/imakiri/stream/src/wire"
 )
@@ -230,7 +231,7 @@ func TestStreamReachesClientsOverUDPAndTCP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	addr, port := freeProxyAddr(t)
-	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), uilive.New())
+	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +254,7 @@ func TestStreamRejectsClientOfAnotherRoot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	addr, port := freeProxyAddr(t)
-	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), uilive.New())
+	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +284,7 @@ func TestStreamClientFollowsRestartedServer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	addr, port := freeProxyAddr(t)
-	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), uilive.New())
+	var p = proxy.New(net.JoinHostPort(addr, strconv.Itoa(int(port))), liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +315,7 @@ func TestStreamSurvivesProxyRestart(t *testing.T) {
 			defer cancel()
 			addr, port := freeProxyAddr(t)
 			var proxyAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
-			var p = proxy.New(proxyAddr, uilive.New())
+			var p = proxy.New(proxyAddr, liveoutput.New(io.Discard))
 			if err := p.Serve(); err != nil {
 				t.Fatal(err)
 			}
@@ -328,7 +329,7 @@ func TestStreamSurvivesProxyRestart(t *testing.T) {
 
 			p.Close()
 			time.Sleep(300 * time.Millisecond)
-			p = proxy.New(proxyAddr, uilive.New())
+			p = proxy.New(proxyAddr, liveoutput.New(io.Discard))
 			if err := p.Serve(); err != nil {
 				t.Fatal(err)
 			}
@@ -348,7 +349,7 @@ func TestStreamClientPlaysNothingForged(t *testing.T) {
 	defer cancel()
 	addr, port := freeProxyAddr(t)
 	var proxyAddr = net.JoinHostPort(addr, strconv.Itoa(int(port)))
-	var p = proxy.New(proxyAddr, uilive.New())
+	var p = proxy.New(proxyAddr, liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}

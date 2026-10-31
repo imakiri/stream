@@ -49,7 +49,11 @@ type Client struct {
 	handshake wire.ClientHandshaker
 
 	opener           atomic.Pointer[wire.StreamOpener]
-	lastOpenUnixNano atomic.Int64
+	lastOpenUnixNano atomic.Int64 // a server hello or a data packet opened
+	// lastDataUnixNano is when the latest data packet opened; zero before
+	// the first. A server without input sends none, and the client
+	// handshakes again every few seconds.
+	lastDataUnixNano atomic.Int64
 
 	// lastHelloSentUnixNano is when the latest client hello went out; the
 	// server hello that answers it gives the round trip for the clock offset.
@@ -114,7 +118,7 @@ func (c *Client) Run(ctx context.Context) error {
 	go c.keepHandshake(ctx, link)
 	go c.receive(ctx, input, decoderIn)
 	go c.play(player, decoderOut)
-	go c.reportE2EDelays(ctx)
+	go c.reportStream(ctx)
 
 	<-ctx.Done()
 	return nil
@@ -159,8 +163,13 @@ func (c *Client) keepHandshake(ctx context.Context, link io.Writer) {
 }
 
 // receive takes server hellos and data packets from the proxy.
+// A handshake is logged only when it brings another stream key: while the
+// server sends no data the client handshakes every few seconds and gets the
+// same key, and reportStream tells that once.
 func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- []byte) {
 	var buf = make([]byte, packetBufferSize)
+	var loggedEpoch uint32
+	var epochLogged bool
 	for {
 		n, err := link.Read(buf)
 		if errors.Is(err, net.ErrClosed) {
@@ -180,8 +189,11 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 			}
 			c.lastOpenUnixNano.Store(receivedAt.UnixNano())
 			c.opener.Store(&opener)
-			log.Printf("handshake with server %s, stream key epoch %08x", c.cfg.ServerID, opener.Epoch())
-			c.syncServerClock(serverClock, receivedAt)
+			var clock = c.syncServerClock(serverClock, receivedAt)
+			if !epochLogged || opener.Epoch() != loggedEpoch {
+				log.Printf("handshake with server %s, stream key epoch %08x; %s", c.cfg.ServerID, opener.Epoch(), clock)
+				loggedEpoch, epochLogged = opener.Epoch(), true
+			}
 		case wire.KindData:
 			var opener = c.opener.Load()
 			if opener == nil {
@@ -191,7 +203,9 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 			if err != nil {
 				continue // another stream key until the handshake catches up, or forged
 			}
-			c.lastOpenUnixNano.Store(time.Now().UnixNano())
+			var openedAt = time.Now().UnixNano()
+			c.lastOpenUnixNano.Store(openedAt)
+			c.lastDataUnixNano.Store(openedAt)
 			select {
 			case <-ctx.Done():
 				return
@@ -206,13 +220,13 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 // answered half a round trip before receivedAt. The error is the asymmetry of
 // the path, at most half the round trip. The round trip is taken from the
 // latest client hello, which is right while it is shorter than
-// clientHelloRetryInterval.
-func (c *Client) syncServerClock(serverClock, receivedAt time.Time) {
+// clientHelloRetryInterval. It returns the estimate for the log.
+func (c *Client) syncServerClock(serverClock, receivedAt time.Time) string {
 	var roundTrip = receivedAt.Sub(time.Unix(0, c.lastHelloSentUnixNano.Load()))
 	var offset = serverClock.Add(roundTrip / 2).Sub(receivedAt)
 	c.serverClockOffsetNanos.Store(int64(offset))
 	c.serverClockKnown.Store(true)
-	log.Printf("server clock minus this clock: %s ± %s (handshake round trip %s)",
+	return fmt.Sprintf("server clock minus this clock %s ± %s (handshake round trip %s)",
 		offset.Round(time.Millisecond), (roundTrip / 2).Round(time.Millisecond), roundTrip.Round(time.Millisecond))
 }
 
@@ -224,14 +238,20 @@ func (c *Client) serverNow() (time.Time, bool) {
 	return time.Now().Add(time.Duration(c.serverClockOffsetNanos.Load())), true
 }
 
-func (c *Client) reportE2EDelays(ctx context.Context) {
+// reportStream logs the end-to-end delay every e2eDelayReportInterval while
+// data comes, and once when the data stops or comes again.
+func (c *Client) reportStream(ctx context.Context) {
 	var ticker = time.NewTicker(e2eDelayReportInterval)
 	defer ticker.Stop()
+	var flow dataFlow
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
+			if change := flow.update(c.lastDataUnixNano.Load(), now); change != "" {
+				log.Print(change)
+			}
 			if samples := c.e2eDelays.take(); len(samples) > 0 {
 				log.Print(formatE2EDelays(samples))
 			}
@@ -245,9 +265,19 @@ func (c *Client) reportE2EDelays(ctx context.Context) {
 // loopback and the default buffers of players like ffplay.
 const playerDatagramSize = 7 * 188
 
+// playerRecoveryTime is how long writes to the player must go without an
+// error before it counts as running again: on a connected UDP socket the
+// refusal of one datagram fails the next write only, so writes to a closed
+// port alternate between failing and passing.
+const playerRecoveryTime = time.Second
+
 // play sends the restored stream to the player and takes the end-to-end delay
-// of every chunk.
+// of every chunk. A player that is not running makes the writes fail
+// (connection refused on loopback); that is logged once, and once more when
+// the player takes the stream again.
 func (c *Client) play(player net.Conn, decoderOut <-chan codec.DecodedChunk) {
+	var playerFailing bool
+	var lastFailure time.Time
 	for chunk := range decoderOut {
 		if serverNow, ok := c.serverNow(); ok {
 			c.e2eDelays.add(codec.InputDelay(chunk.InputUnixMilli, serverNow))
@@ -256,11 +286,19 @@ func (c *Client) play(player net.Conn, decoderOut <-chan codec.DecodedChunk) {
 		for len(data) > 0 {
 			var piece = data[:min(len(data), playerDatagramSize)]
 			data = data[len(piece):]
-			if _, err := player.Write(piece); err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					return
+			_, err := player.Write(piece)
+			switch {
+			case errors.Is(err, net.ErrClosed):
+				return
+			case err != nil:
+				if !playerFailing {
+					log.Printf("failed to send to the player, is it running? %s; dropping the stream until it takes it", err)
+					playerFailing = true
 				}
-				log.Printf("failed to send to the player: %s", err)
+				lastFailure = time.Now()
+			case playerFailing && time.Since(lastFailure) > playerRecoveryTime:
+				log.Printf("the player takes the stream again")
+				playerFailing = false
 			}
 		}
 	}

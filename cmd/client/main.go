@@ -17,8 +17,8 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/gosuri/uilive"
 	"github.com/imakiri/stream/src"
+	"github.com/imakiri/stream/src/liveoutput"
 )
 
 func main() {
@@ -39,11 +39,8 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	var output = uilive.New()
-	output.RefreshInterval = time.Second
-	output.Start()
-	defer output.Stop()
-	log.SetOutput(output.Bypass())
+	var output = liveoutput.New(os.Stdout)
+	log.SetOutput(output.Log())
 
 	config, err := src.LoadClientConfig(*cfg)
 	if err != nil {
@@ -52,7 +49,7 @@ func main() {
 	config.Credentials = identity.Credentials
 	config.Verifier = identity.Verifier()
 	config.ServerID = identity.Enrollment.ServerID
-	config.InputReporter = src.NewReporter(output, "in ")
+	config.InputReporter = src.NewReporter(output, "in")
 	log.Printf("client %s, certificate valid until %s", config.Credentials.Certificate.ID, config.Credentials.Certificate.NotAfter.Format(time.DateOnly))
 
 	client, err := src.NewClient(config)

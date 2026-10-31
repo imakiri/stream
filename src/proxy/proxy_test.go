@@ -2,13 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/gofrs/uuid/v5"
-	"github.com/gosuri/uilive"
 	"github.com/imakiri/stream/src/frame"
+	"github.com/imakiri/stream/src/liveoutput"
 	"github.com/imakiri/stream/src/wire"
 )
 
@@ -34,7 +35,7 @@ func freeAddr(t *testing.T) string {
 func startProxy(t *testing.T) (*Proxy, string) {
 	t.Helper()
 	var addr = freeAddr(t)
-	var p = New(addr, uilive.New())
+	var p = New(addr, liveoutput.New(io.Discard))
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +194,7 @@ func TestProxyFollowsUDPPeerToNewPort(t *testing.T) {
 // removed after the timeout, while one that keeps saying hello stays.
 func TestProxyDropsSilentUDPPeer(t *testing.T) {
 	var addr = freeAddr(t)
-	var p = New(addr, uilive.New())
+	var p = New(addr, liveoutput.New(io.Discard))
 	p.peerTimeout = 1500 * time.Millisecond
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)
@@ -248,7 +249,7 @@ func TestProxyEchoesTCPKeepalive(t *testing.T) {
 // disconnected after the timeout.
 func TestProxyDropsSilentTCPPeer(t *testing.T) {
 	var addr = freeAddr(t)
-	var p = New(addr, uilive.New())
+	var p = New(addr, liveoutput.New(io.Discard))
 	p.peerTimeout = 500 * time.Millisecond
 	if err := p.Serve(); err != nil {
 		t.Fatal(err)

@@ -143,7 +143,8 @@ printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > 
 modprobe tcp_bbr && sysctl --system && tc qdisc replace dev eth0 root fq
 ```
 
-Logs: `journalctl -u stream-proxy -f`. To update, copy the new binary and
+Logs: `journalctl -u stream-proxy -f` (the speed line is shown only on a
+terminal, not in the journal). To update, copy the new binary and
 `systemctl restart stream-proxy`; peers register again on their own.
 
 ### Server (streamer)
@@ -157,21 +158,35 @@ Logs: `journalctl -u stream-proxy -f`. To update, copy the new binary and
    Recording → Type: Custom Output (FFmpeg) →
    - FFmpeg Output Type: Output to URL, URL
      `udp://127.0.0.1:2557?pkt_size=1316`, Container Format: mpegts
-   - Muxer Settings: `mpegts_flags=+resend_headers muxdelay=0 muxpreload=0`
+   - Muxer Settings: `mpegts_flags=+resend_headers` (`muxdelay` and
+     `muxpreload` are options of the ffmpeg command, OBS refuses them; its
+     muxer starts without that delay anyway)
    - Video: bitrate 8000 Kbps, keyframe interval 60 frames (1 s at 60 fps),
-     encoder `hevc_nvenc` (or `h264_nvenc`), Video Encoder Settings:
-     `preset=p4 tune=ll rc=cbr bf=0 zerolatency=1`
+     and by GPU:
+     - AMD: encoder `hevc_amf` (on Linux it needs the AMF runtime, e.g. the
+       AUR package `amf-amdgpu`), Video Encoder Settings:
+       `usage=lowlatency quality=quality rc=cbr enforce_hrd=1 filler_data=1 maxrate=8000k bufsize=500k bf=0 async_depth=1`.
+       Without `enforce_hrd=1` AMF ignores `bufsize` and sends frames of up
+       to 300 KB.
+     - NVIDIA: encoder `hevc_nvenc`, Video Encoder Settings:
+       `preset=p4 tune=ll rc=cbr bf=0 zerolatency=1 bufsize=500k`
+
+     `hevc_vaapi` does not work here: this OBS output gives the encoder
+     frames in system memory, and VAAPI takes only frames in GPU memory.
    - Audio: `aac`, 160 Kbps
 
-   Then Start Recording. Use constant bitrate: a constant-quality encoder
-   sends bursts that FEC cannot cover. No B-frames, a keyframe every second
-   so a new or recovering viewer starts fast, and `resend_headers` so a
-   player that joins mid-stream finds the stream tables.
+   Then Start Recording. Use constant bitrate with a small buffer (500k is
+   1/16 s at 8 Mbit/s): a constant-quality encoder, or a large buffer, sends
+   keyframes and scene changes as bursts of 2-4 times the bitrate. No
+   B-frames, a keyframe every second so a new or recovering viewer starts
+   fast, and `resend_headers` so a player that joins mid-stream finds the
+   stream tables.
 
    A file instead of OBS (`-re` sends it at its own pace):
    ```
    ffmpeg -re -i file.mkv -map 0:v:0 -map 0:a:0 \
-     -c:v hevc_nvenc -preset p4 -tune ll -rc cbr -b:v 8M -maxrate 8M -bufsize 2M -g 60 -bf 0 \
+     -c:v hevc_amf -usage lowlatency -quality quality -rc cbr -enforce_hrd 1 -filler_data 1 \
+     -b:v 8M -maxrate 8M -bufsize 500k -g 60 -bf 0 \
      -c:a aac -b:a 160k -ac 2 \
      -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0 \
      "udp://127.0.0.1:2557?pkt_size=1316"
@@ -200,10 +215,17 @@ next to the binary), `-sign <key>` and `-days <n>`.
    ```
    ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop "udp://127.0.0.1:25566?overrun_nonfatal=1&fifo_size=1024&buffer_size=98304"
    ```
-   (`play.bat` in the Windows release does this.)
+   (`play.bat` in the Windows release does this.) The client sends the
+   stream to this local UDP port and the player reads whatever arrives
+   there; UDP has no listen mode or connection, so the two can start in any
+   order and the player can be restarted while the client runs. While no
+   player is open, the client drops the stream and logs that once.
 
-The client log shows the handshake, the clock offset to the server and the
-end-to-end delay every 5 s.
+The client log shows the handshake with the clock offset to the server
+(again only when the stream key changes), the end-to-end delay every 5 s, and
+one line when the data from the server stops or comes again: a server without
+input from OBS answers handshakes but sends no data. The speed of what comes
+from the proxy stays on the bottom line of the terminal.
 
 ## Measuring the link
 

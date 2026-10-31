@@ -2,19 +2,21 @@ package src
 
 import (
 	"fmt"
-	"io"
+
+	"github.com/imakiri/stream/src/liveoutput"
 )
 
-// Reporter prints the speed an observer measured, one line per report.
+// Reporter shows the speed an observer measured as a status line.
 type Reporter struct {
-	header string
-	output io.Writer
+	name   string
+	output *liveoutput.Output
 }
 
-func NewReporter(output io.Writer, header string) *Reporter {
-	return &Reporter{header: header, output: output}
+// NewReporter shows the speed on the status line called name, e.g. "in".
+func NewReporter(output *liveoutput.Output, name string) *Reporter {
+	return &Reporter{name: name, output: output}
 }
 
 func (r *Reporter) Report(total, delta uint64) {
-	_, _ = fmt.Fprintf(r.output, "[%s] delta: %6d kbit/sec, total: %6d mbit\n", r.header, delta*8/(1<<10), total*8/(1<<20))
+	r.output.SetStatus(r.name, fmt.Sprintf("[%-3s] %6d kbit/s, total %6d mbit", r.name, delta*8/(1<<10), total*8/(1<<20)))
 }

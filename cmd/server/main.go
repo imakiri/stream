@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/atotto/clipboard"
-	"github.com/gosuri/uilive"
 	"github.com/imakiri/stream/src"
+	"github.com/imakiri/stream/src/liveoutput"
 )
 
 func main() {
@@ -58,11 +58,8 @@ func main() {
 		return
 	}
 
-	var output = uilive.New()
-	output.RefreshInterval = time.Second
-	output.Start()
-	defer output.Stop()
-	log.SetOutput(output.Bypass())
+	var output = liveoutput.New(os.Stdout)
+	log.SetOutput(output.Log())
 
 	config, err := src.LoadServerConfig(*cfg)
 	if err != nil {
