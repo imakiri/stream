@@ -186,7 +186,13 @@ terminal, not in the journal). To update, copy the new binary and
 
      `hevc_vaapi` does not work here: this OBS output gives the encoder
      frames in system memory, and VAAPI takes only frames in GPU memory.
-   - Audio: `aac`, 160 Kbps
+   - Audio: encoder `libopus`, 160 Kbps, Audio Encoder Settings
+     `frame_duration=10`; and Settings → Audio → Advanced → Low Latency
+     Audio Buffering Mode on (OBS restarts). The muxer and the player hold
+     each video frame until the audio of the same moment arrives, so the
+     audio delay inside OBS is the video delay too: with `aac` and the audio
+     buffering OBS grows on its own (42 ms here) the picture came ~90 ms
+     later (375 ms from screen to screen instead of 284).
 
    Then Start Recording. Use constant bitrate with a small buffer (500k is
    1/16 s at 8 Mbit/s): a constant-quality encoder, or a large buffer, sends
@@ -200,7 +206,7 @@ terminal, not in the journal). To update, copy the new binary and
    ffmpeg -re -i file.mkv -map 0:v:0 -map 0:a:0 \
      -c:v hevc_amf -usage lowlatency -quality quality -rc cbr -enforce_hrd 1 -filler_data 1 \
      -b:v 8M -maxrate 8M -bufsize 500k -g 60 -bf 0 \
-     -c:a aac -b:a 160k -ac 2 \
+     -c:a libopus -b:a 160k -frame_duration 10 -ac 2 \
      -f mpegts -mpegts_flags +resend_headers -muxdelay 0 -muxpreload 0 \
      "udp://127.0.0.1:2557?pkt_size=1316"
    ```
@@ -224,24 +230,41 @@ next to the binary), `-sign <key>` and `-days <n>`.
    the public key and copies it to the clipboard. Send the key to the
    streamer, paste the enrollment they send back, and the client saves it as
    `client.enrollment`. Next starts connect right away.
-3. Start the player:
+3. Start the player. mpv with the script from `player/` keeps closest to
+   live (measured from screen to screen through the proxy: ~285 ms with mpv;
+   ffplay keeps ~0.35 s of video queued and showed the picture ~290 ms
+   later than mpv; `player/play-mpv.sh` and `player/play-mpv.bat` run this):
+   ```
+   mpv --profile=low-latency --hwdec=auto --audio-buffer=0.05 --script=player/mpv-live-edge.lua "udp://127.0.0.1:25566?overrun_nonfatal=1&fifo_size=1024"
+   ```
+   `--audio-buffer=0.05` is needed: the profile sets it to 0, the audio
+   device then runs dry all the time, and mpv, which times the video by the
+   audio, stalls and falls behind. The script catches up a small lag (after a
+   pause or a stall) by playing 1.1 times faster, shows how far behind live
+   you are after seeking back, and End or Ctrl+Right (for keyboards without
+   End) jumps to live (it opens the stream again; the picture comes with the
+   next keyframe, within a second). So
+   does a forward seek (Right, Up, Shift+Right) that would go past the live
+   edge, where mpv by itself says "Cannot seek in this stream".
+
+   Or ffplay (`player/play.sh`, `player/play.bat`):
    ```
    ffplay -f mpegts -fflags nobuffer -flags low_delay -framedrop -sync ext "udp://127.0.0.1:25566?overrun_nonfatal=1&fifo_size=1024&buffer_size=98304"
    ```
-   (`play.bat` in the Windows release does this.) `-sync ext` keeps the
-   picture on its own clock: by default ffplay follows the audio, and with
-   `-framedrop` it then throws away most video frames of a live stream as
-   late, which looks like stutter. The client sends the
-   stream to this local UDP port and the player reads whatever arrives
-   there; UDP has no listen mode or connection, so the two can start in any
-   order and the player can be restarted while the client runs. While no
-   player is open, the client drops the stream and logs that once.
+   `-sync ext` keeps the picture on its own clock: by default ffplay follows
+   the audio, and with `-framedrop` it then throws away most video frames of
+   a live stream as late, which looks like stutter.
+
+   The client sends the stream to this local UDP port and the player reads
+   whatever arrives there; UDP has no listen mode or connection, so the two
+   can start in any order and the player can be restarted while the client
+   runs. While no player is open, the client drops the stream and logs that
+   once.
 
 The client log shows the handshake with the clock offset to the server
 (again only when the stream key changes), the end-to-end delay and the lost
-chunks every 5 s, and
-one line when the data from the server stops or comes again: a server without
-input from OBS answers handshakes but sends no data. The speed of what comes
+chunks every 5 s, and one line when the data from the server stops or comes
+again: a server without input from OBS answers handshakes but sends no data. The speed of what comes
 from the proxy stays on the bottom line of the terminal.
 
 ## Measuring the link
@@ -273,3 +296,5 @@ proxy.
 | `src/keystore.go` | key files and enrollment |
 | `src/config.go` | TOML configs |
 | `cmd/stats` | link delay measurement |
+| `player/mpv-live-edge.lua` | mpv script that keeps playback at the live edge |
+| `player/play-mpv.sh`, `player/play.sh` (`.bat` on Windows) | start mpv (with the script) or ffplay |
