@@ -65,7 +65,19 @@ type Decoder struct {
 	assemblyQueue chan *PacketV2
 	restoreQueue  chan []*PacketV2
 	dispatchQueue chan *Chunk
-	resultQueue   chan []byte
+	resultQueue   chan DecodedChunk
+}
+
+// DecodedChunk is the data of one restored chunk, in stream order.
+type DecodedChunk struct {
+	Data []byte
+	// InputUnixMilli is when the chunk reached the encoder, by the sender's
+	// clock; see InputDelay.
+	InputUnixMilli uint32
+}
+
+func decoded(chunk *Chunk) DecodedChunk {
+	return DecodedChunk{Data: chunk.Data(), InputUnixMilli: chunk.inputUnixMilli}
 }
 
 func NewDecoder(dataParts, totalParts, assemblerLines, dispatcherSize uint64) (decoder *Decoder, err error) {
@@ -168,7 +180,7 @@ dispatch:
 					select {
 					case <-ctx.Done():
 						return
-					case decoder.resultQueue <- decoder.dispatcher.chunks[at].Data():
+					case decoder.resultQueue <- decoded(decoder.dispatcher.chunks[at]):
 						decoder.dispatcher.last = decoder.dispatcher.chunks[at].csn
 						decoder.dispatcher.awaiting = decoder.dispatcher.chunks[at].csn + 1
 					}
@@ -182,7 +194,7 @@ dispatch:
 				select {
 				case <-ctx.Done():
 					return
-				case decoder.resultQueue <- chunk.Data():
+				case decoder.resultQueue <- decoded(chunk):
 					decoder.dispatcher.last = chunk.csn
 					decoder.dispatcher.awaiting++
 				}
@@ -208,7 +220,7 @@ dispatch:
 				select {
 				case <-ctx.Done():
 					return
-				case decoder.resultQueue <- decoder.dispatcher.chunks[at].Data():
+				case decoder.resultQueue <- decoded(decoder.dispatcher.chunks[at]):
 					decoder.dispatcher.last = decoder.dispatcher.chunks[at].csn
 					decoder.dispatcher.awaiting++
 					decoder.dispatcher.chunks[at] = nil
@@ -417,8 +429,8 @@ func (decoder *Decoder) OutgoingSize() uint64 {
 // Decode starts the decoder. The in channel is never closed by the decoder,
 // so writers may keep sending until ctx is done; out is closed once the
 // decoder has stopped after ctx is done.
-func (decoder *Decoder) Decode(ctx context.Context) (in chan<- []byte, out <-chan []byte, err error) {
-	decoder.resultQueue = make(chan []byte, 16*decoder.restorer.data)
+func (decoder *Decoder) Decode(ctx context.Context) (in chan<- []byte, out <-chan DecodedChunk, err error) {
+	decoder.resultQueue = make(chan DecodedChunk, 16*decoder.restorer.data)
 	decoder.dispatchQueue = make(chan *Chunk, 16)
 	decoder.restoreQueue = make(chan []*PacketV2, 16*decoder.restorer.data)
 	decoder.assemblyQueue = make(chan *PacketV2, 16*decoder.restorer.data)

@@ -111,9 +111,12 @@ func TestHandshakeDeliversStreamKey(t *testing.T) {
 	if routed, _ := ServerHelloClientID(serverHello); routed != clientCreds.Certificate.ID {
 		t.Fatalf("server hello routed to %s", routed)
 	}
-	opener, err := pair.client.FinishServerHello(serverHello, now)
+	opener, serverClock, err := pair.client.FinishServerHello(serverHello, now)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !serverClock.Equal(time.UnixMilli(now.UnixMilli())) {
+		t.Fatalf("server clock %s, want %s", serverClock, now)
 	}
 
 	sealer, err := NewStreamSealer(pair.key)
@@ -173,7 +176,7 @@ func TestHandshakeRejects(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pair.client.FinishServerHello(serverHello, now); !errors.Is(err, ErrInvalidHandshake) {
+		if _, _, err := pair.client.FinishServerHello(serverHello, now); !errors.Is(err, ErrInvalidHandshake) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -188,7 +191,7 @@ func TestHandshakeRejects(t *testing.T) {
 		if _, err := pair.client.NewClientHello(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pair.client.FinishServerHello(oldServerHello, now); !errors.Is(err, ErrInvalidHandshake) {
+		if _, _, err := pair.client.FinishServerHello(oldServerHello, now); !errors.Is(err, ErrInvalidHandshake) {
 			t.Fatalf("got %v", err)
 		}
 	})
@@ -197,7 +200,7 @@ func TestHandshakeRejects(t *testing.T) {
 		var pair = newHandshakePair(t, pki, serverCreds, clientCreds)
 		hello, _ := pair.client.NewClientHello()
 		serverHello, _, _ := pair.server.AnswerClientHello(hello, now)
-		opener, err := pair.client.FinishServerHello(serverHello, now)
+		opener, _, err := pair.client.FinishServerHello(serverHello, now)
 		if err != nil {
 			t.Fatal(err)
 		}

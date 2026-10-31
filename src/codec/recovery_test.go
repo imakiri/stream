@@ -19,7 +19,7 @@ const (
 // recoveryRun encodes chunks, passes every packet the drop function keeps to
 // the decoder and returns the decoded chunks in order, together with the
 // chunks that went into the encoder.
-func recoveryRun(t *testing.T, ctx context.Context, decoderIn chan<- []byte, decoderOut <-chan []byte,
+func recoveryRun(t *testing.T, ctx context.Context, decoderIn chan<- []byte, decoderOut <-chan DecodedChunk,
 	chunks int, drop func(p *PacketV2) bool) (sent, got [][]byte) {
 	t.Helper()
 	encoder, err := NewEncoder(5*time.Millisecond, recoveryGroup, recoveryDataParts, recoveryTotalParts)
@@ -56,7 +56,7 @@ func recoveryRun(t *testing.T, ctx context.Context, decoderIn chan<- []byte, dec
 	for range chunks {
 		select {
 		case b := <-decoderOut:
-			got = append(got, b)
+			got = append(got, b.Data)
 		case <-time.After(time.Second):
 			return sent, got
 		}

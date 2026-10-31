@@ -2,6 +2,8 @@ package codec
 
 import (
 	"encoding/binary"
+	"time"
+
 	"github.com/klauspost/reedsolomon"
 )
 
@@ -11,12 +13,21 @@ type Chunk struct {
 	parts   uint64
 	session uint64 // not on the wire: taken from the packets the chunk was restored from
 
-	version uint8  // 0...1
-	kind    uint8  // 1...2
-	_       uint32 // 2...6
-	csn     uint64 // 6...14
-	size    uint64 // 14...22
-	data    []byte
+	version uint8 // 0...1
+	kind    uint8 // 1...2
+	// inputUnixMilli is when the first byte of the chunk reached the
+	// encoder, by the sender's clock: the low 32 bits of the unix time in
+	// milliseconds, so it wraps every 49 days; compare with InputDelay.
+	inputUnixMilli uint32 // 2...6
+	csn            uint64 // 6...14
+	size           uint64 // 14...22
+	data           []byte
+}
+
+// InputDelay returns how long ago, at now by the sender's clock, a chunk with
+// this input time reached the encoder.
+func InputDelay(inputUnixMilli uint32, now time.Time) time.Duration {
+	return time.Duration(int32(uint32(now.UnixMilli())-inputUnixMilli)) * time.Millisecond
 }
 
 func NewChunk(parts, csn uint64, kind uint8, data []byte) (*Chunk, []byte) {
@@ -61,7 +72,7 @@ func (c *Chunk) Marshal(total uint64) [][]byte {
 
 	dst[i][0] = c.version
 	dst[i][1] = c.kind
-	//binary.LittleEndian.PutUint32(dst[i][2:6], c.id)
+	binary.LittleEndian.PutUint32(dst[i][2:6], c.inputUnixMilli)
 	binary.LittleEndian.PutUint64(dst[i][6:14], c.csn)
 	binary.LittleEndian.PutUint64(dst[i][14:22], uint64(len(c.data)))
 
@@ -82,7 +93,7 @@ func (c *Chunk) Unmarshal(data [][]byte) bool {
 
 	c.version = data[i][0]
 	c.kind = data[i][1]
-	//c.id = binary.LittleEndian.Uint32(data[i][2:6])
+	c.inputUnixMilli = binary.LittleEndian.Uint32(data[i][2:6])
 	c.csn = binary.LittleEndian.Uint64(data[i][6:14])
 	c.size = binary.LittleEndian.Uint64(data[i][14:22])
 	// size comes from restored bytes; a chunk mixed from foreign packets would

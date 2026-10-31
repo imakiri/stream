@@ -43,19 +43,22 @@ import (
 //	138..170  server ephemeral X25519 public key
 //	170..174  stream key epoch, big endian
 //	174..222  stream key, AES-256-GCM sealed with the wrap key, zero nonce
-//	222..286  server signature of the client hello followed by bytes 0..222
+//	222..230  server clock when it answered, unix milliseconds, big endian
+//	230..294  server signature of the client hello followed by bytes 0..230
 //
 // wrap key = HKDF-SHA256(X25519 shared secret, salt = SHA-256(client hello ||
 // server hello 0..174), info = wrapKeyInfo). It is used once, so the zero
-// nonce is safe.
+// nonce is safe. The server clock lets the client relate the times in the
+// stream (codec chunk input times) to its own clock.
 const (
 	ClientHelloSize = 2 + CertificateSize + 32 + ed25519.SignatureSize
-	ServerHelloSize = 2 + 16 + CertificateSize + 32 + 4 + 32 + 16 + ed25519.SignatureSize
+	ServerHelloSize = 2 + 16 + CertificateSize + 32 + 4 + 32 + 16 + 8 + ed25519.SignatureSize
 )
 
 const (
 	clientHelloSignedSize   = ClientHelloSize - ed25519.SignatureSize
 	serverHelloWrapAADSize  = 174
+	serverHelloClockStart   = 222
 	serverHelloSignedSize   = ServerHelloSize - ed25519.SignatureSize
 	serverHelloEphemeralEnd = 170
 	wrapKeyInfo             = "imakiri/stream wire v3 stream key wrap"
@@ -66,7 +69,8 @@ var ErrInvalidHandshake = errors.New("invalid handshake")
 // ServerHandshaker answers client hellos on the server.
 type ServerHandshaker interface {
 	// AnswerClientHello verifies a client hello and returns the server hello
-	// for that client along with the client's ID.
+	// for that client along with the client's ID. now is the server clock,
+	// which the server hello carries.
 	AnswerClientHello(clientHello []byte, now time.Time) (serverHello []byte, clientID uuid.UUID, err error)
 }
 
@@ -76,8 +80,9 @@ type ClientHandshaker interface {
 	// hello is accepted only for the latest attempt.
 	NewClientHello() ([]byte, error)
 	// FinishServerHello verifies the server hello of the latest attempt and
-	// returns the opener for the stream.
-	FinishServerHello(serverHello []byte, now time.Time) (StreamOpener, error)
+	// returns the opener for the stream and the server clock when it
+	// answered.
+	FinishServerHello(serverHello []byte, now time.Time) (opener StreamOpener, serverClock time.Time, err error)
 }
 
 // ServerHelloClientID returns the client a server hello is addressed to, for
@@ -159,6 +164,7 @@ func (h *CertificateServerHandshake) AnswerClientHello(clientHello []byte, now t
 		return nil, uuid.Nil, err
 	}
 	wrap.Seal(serverHello[serverHelloWrapAADSize:serverHelloWrapAADSize], make([]byte, wrap.NonceSize()), h.StreamKey.Key[:], serverHello[:serverHelloWrapAADSize])
+	binary.BigEndian.PutUint64(serverHello[serverHelloClockStart:serverHelloSignedSize], uint64(now.UnixMilli()))
 
 	copy(serverHello[serverHelloSignedSize:], ed25519.Sign(h.Credentials.PrivateKey, serverHelloSigned(clientHello, serverHello)))
 	return serverHello, clientCertificate.ID, nil
@@ -195,53 +201,58 @@ func (h *CertificateClientHandshake) NewClientHello() ([]byte, error) {
 	return hello, nil
 }
 
-func (h *CertificateClientHandshake) FinishServerHello(serverHello []byte, now time.Time) (StreamOpener, error) {
+func (h *CertificateClientHandshake) FinishServerHello(serverHello []byte, now time.Time) (StreamOpener, time.Time, error) {
 	h.mu.Lock()
 	var ephemeral, clientHello = h.ephemeral, h.hello
 	h.mu.Unlock()
 	if ephemeral == nil {
-		return nil, fmt.Errorf("%w: no client hello sent", ErrInvalidHandshake)
+		return nil, time.Time{}, fmt.Errorf("%w: no client hello sent", ErrInvalidHandshake)
 	}
 
 	clientID, ok := ServerHelloClientID(serverHello)
 	if !ok {
-		return nil, fmt.Errorf("%w: not a server hello", ErrInvalidHandshake)
+		return nil, time.Time{}, fmt.Errorf("%w: not a server hello", ErrInvalidHandshake)
 	}
 	if clientID != h.Credentials.Certificate.ID {
-		return nil, fmt.Errorf("%w: server hello for %s", ErrInvalidHandshake, clientID)
+		return nil, time.Time{}, fmt.Errorf("%w: server hello for %s", ErrInvalidHandshake, clientID)
 	}
 	serverCertificate, err := ParseCertificate(serverHello[18 : 18+CertificateSize])
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if serverCertificate.ID != h.ServerID {
-		return nil, fmt.Errorf("%w: certificate %s is not the server %s", ErrInvalidHandshake, serverCertificate.ID, h.ServerID)
+		return nil, time.Time{}, fmt.Errorf("%w: certificate %s is not the server %s", ErrInvalidHandshake, serverCertificate.ID, h.ServerID)
 	}
 	if err := h.Verifier.VerifyCertificate(serverCertificate, now); err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if !ed25519.Verify(serverCertificate.PublicKey, serverHelloSigned(clientHello, serverHello), serverHello[serverHelloSignedSize:]) {
-		return nil, fmt.Errorf("%w: bad server signature, or the hello answers an older attempt", ErrInvalidHandshake)
+		return nil, time.Time{}, fmt.Errorf("%w: bad server signature, or the hello answers an older attempt", ErrInvalidHandshake)
 	}
 
 	serverEphemeral, err := ecdh.X25519().NewPublicKey(serverHello[18+CertificateSize : serverHelloEphemeralEnd])
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
+		return nil, time.Time{}, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
 	}
 	shared, err := ephemeral.ECDH(serverEphemeral)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
+		return nil, time.Time{}, fmt.Errorf("%w: %w", ErrInvalidHandshake, err)
 	}
 	wrap, err := deriveWrapAEAD(shared, clientHello, serverHello[:serverHelloWrapAADSize])
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	key, err := wrap.Open(nil, make([]byte, wrap.NonceSize()), serverHello[serverHelloWrapAADSize:serverHelloSignedSize], serverHello[:serverHelloWrapAADSize])
+	key, err := wrap.Open(nil, make([]byte, wrap.NonceSize()), serverHello[serverHelloWrapAADSize:serverHelloClockStart], serverHello[:serverHelloWrapAADSize])
 	if err != nil {
-		return nil, fmt.Errorf("%w: stream key: %w", ErrInvalidHandshake, err)
+		return nil, time.Time{}, fmt.Errorf("%w: stream key: %w", ErrInvalidHandshake, err)
 	}
 
 	var streamKey = StreamKey{Epoch: binary.BigEndian.Uint32(serverHello[serverHelloEphemeralEnd:serverHelloWrapAADSize])}
 	copy(streamKey.Key[:], key)
-	return NewStreamOpener(streamKey)
+	opener, err := NewStreamOpener(streamKey)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	var serverClock = time.UnixMilli(int64(binary.BigEndian.Uint64(serverHello[serverHelloClockStart:serverHelloSignedSize])))
+	return opener, serverClock, nil
 }

@@ -79,7 +79,7 @@ func TestEnrollmentFromFirstStartToConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := clientHandshake.FinishServerHello(serverHello, time.Now()); err != nil {
+	if _, _, err := clientHandshake.FinishServerHello(serverHello, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 }

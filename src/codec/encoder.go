@@ -18,6 +18,8 @@ type Encoder struct {
 		timeout time.Duration
 		timer   *time.Timer
 		buf     []byte
+		// bufStartedAt is when the first byte now in buf arrived
+		bufStartedAt time.Time
 	}
 	encoder struct {
 		rs      reedsolomon.Encoder
@@ -33,7 +35,7 @@ type Encoder struct {
 	}
 
 	aggregateQueue  chan []byte
-	encodeQueue     chan []byte
+	encodeQueue     chan aggregate
 	dispatcherQueue chan *PacketV2
 	resultQueue     chan []byte
 }
@@ -75,6 +77,12 @@ func (encoder *Encoder) OutgoingSize() uint64 {
 	return PacketV2Size
 }
 
+// aggregate is the data of one chunk and when its first byte arrived.
+type aggregate struct {
+	data      []byte
+	startedAt time.Time
+}
+
 func (encoder *Encoder) aggregatorFlush(ctx context.Context) {
 	encoder.aggregator.mu.Lock()
 	defer encoder.aggregator.mu.Unlock()
@@ -85,7 +93,7 @@ func (encoder *Encoder) aggregatorFlush(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
-	case encoder.encodeQueue <- agData:
+	case encoder.encodeQueue <- aggregate{data: agData, startedAt: encoder.aggregator.bufStartedAt}:
 		return
 	}
 }
@@ -133,7 +141,7 @@ func (encoder *Encoder) encode(ctx context.Context) {
 	encoder.encoder.csn = 1
 	defer func() { encoder.encoder.csn = 0 }()
 	var err error
-	var data []byte
+	var input aggregate
 	var packet *PacketV2
 	var ok bool
 encode:
@@ -141,15 +149,16 @@ encode:
 		select {
 		case <-ctx.Done():
 			return
-		case data, ok = <-encoder.encodeQueue:
+		case input, ok = <-encoder.encodeQueue:
 			if !ok {
 				return
 			}
-			var chunk, rem = NewChunk(encoder.encoder.data, encoder.encoder.csn, KindData, data)
+			var chunk, rem = NewChunk(encoder.encoder.data, encoder.encoder.csn, KindData, input.data)
 			if rem != nil {
 				log.Printf("encode: NewChunk: res is not nil: len %d", len(rem))
 				continue
 			}
+			chunk.inputUnixMilli = uint32(input.startedAt.UnixMilli())
 			var data = chunk.Marshal(encoder.encoder.total)
 
 			err = encoder.encoder.rs.Encode(data)
@@ -188,7 +197,11 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 		case <-encoder.aggregator.timer.C:
 			encoder.aggregatorFlush(ctx)
 		case data = <-encoder.aggregateQueue:
+			var arrivedAt = time.Now()
 			for len(data) > 0 {
+				if len(encoder.aggregator.buf) == 0 {
+					encoder.aggregator.bufStartedAt = arrivedAt
+				}
 				sep = min(cap(encoder.aggregator.buf)-len(encoder.aggregator.buf), len(data))
 				encoder.aggregator.buf = append(encoder.aggregator.buf, data[:sep]...)
 				data = data[sep:]
@@ -224,7 +237,7 @@ func (encoder *Encoder) Encode(ctx context.Context) (in chan<- []byte, out <-cha
 	}
 	encoder.resultQueue = make(chan []byte, 8*encoder.dispatcher.chunks)
 	encoder.dispatcherQueue = make(chan *PacketV2, 8*encoder.dispatcher.chunks)
-	encoder.encodeQueue = make(chan []byte, 64*encoder.encoder.data)
+	encoder.encodeQueue = make(chan aggregate, 64*encoder.encoder.data)
 	encoder.aggregateQueue = make(chan []byte, 64*encoder.encoder.data)
 
 	go encoder.dispatch(ctx)

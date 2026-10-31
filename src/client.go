@@ -50,6 +50,15 @@ type Client struct {
 
 	opener           atomic.Pointer[wire.StreamOpener]
 	lastOpenUnixNano atomic.Int64
+
+	// lastHelloSentUnixNano is when the latest client hello went out; the
+	// server hello that answers it gives the round trip for the clock offset.
+	lastHelloSentUnixNano atomic.Int64
+	// serverClockOffsetNanos is the server clock minus the client clock,
+	// estimated at the handshake; valid once serverClockKnown is set.
+	serverClockOffsetNanos atomic.Int64
+	serverClockKnown       atomic.Bool
+	e2eDelays              e2eDelays
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -105,6 +114,7 @@ func (c *Client) Run(ctx context.Context) error {
 	go c.keepHandshake(ctx, link)
 	go c.receive(ctx, input, decoderIn)
 	go c.play(player, decoderOut)
+	go c.reportE2EDelays(ctx)
 
 	<-ctx.Done()
 	return nil
@@ -134,6 +144,7 @@ func (c *Client) keepHandshake(ctx context.Context, link io.Writer) {
 				c.opener.Store(nil)
 			}
 			if hello != nil {
+				c.lastHelloSentUnixNano.Store(time.Now().UnixNano())
 				if _, err := link.Write(hello); err != nil {
 					return // closed; the link logs its own send failures
 				}
@@ -161,14 +172,16 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 		}
 		switch wire.PacketKind(buf[:n]) {
 		case wire.KindServerHello:
-			opener, err := c.handshake.FinishServerHello(buf[:n], time.Now())
+			var receivedAt = time.Now()
+			opener, serverClock, err := c.handshake.FinishServerHello(buf[:n], receivedAt)
 			if err != nil {
 				log.Printf("rejected server hello: %s", err)
 				continue
 			}
-			c.lastOpenUnixNano.Store(time.Now().UnixNano())
+			c.lastOpenUnixNano.Store(receivedAt.UnixNano())
 			c.opener.Store(&opener)
 			log.Printf("handshake with server %s, stream key epoch %08x", c.cfg.ServerID, opener.Epoch())
+			c.syncServerClock(serverClock, receivedAt)
 		case wire.KindData:
 			var opener = c.opener.Load()
 			if opener == nil {
@@ -188,15 +201,58 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 	}
 }
 
+// syncServerClock estimates the server clock offset from a server hello
+// stamped at serverClock and received at receivedAt, NTP style: the server
+// answered half a round trip before receivedAt. The error is the asymmetry of
+// the path, at most half the round trip. The round trip is taken from the
+// latest client hello, which is right while it is shorter than
+// clientHelloRetryInterval.
+func (c *Client) syncServerClock(serverClock, receivedAt time.Time) {
+	var roundTrip = receivedAt.Sub(time.Unix(0, c.lastHelloSentUnixNano.Load()))
+	var offset = serverClock.Add(roundTrip / 2).Sub(receivedAt)
+	c.serverClockOffsetNanos.Store(int64(offset))
+	c.serverClockKnown.Store(true)
+	log.Printf("server clock minus this clock: %s ± %s (handshake round trip %s)",
+		offset.Round(time.Millisecond), (roundTrip / 2).Round(time.Millisecond), roundTrip.Round(time.Millisecond))
+}
+
+// serverNow returns the current time by the server clock, if it is known.
+func (c *Client) serverNow() (time.Time, bool) {
+	if !c.serverClockKnown.Load() {
+		return time.Time{}, false
+	}
+	return time.Now().Add(time.Duration(c.serverClockOffsetNanos.Load())), true
+}
+
+func (c *Client) reportE2EDelays(ctx context.Context) {
+	var ticker = time.NewTicker(e2eDelayReportInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if samples := c.e2eDelays.take(); len(samples) > 0 {
+				log.Print(formatE2EDelays(samples))
+			}
+		}
+	}
+}
+
 // playerDatagramSize is 7 mpegts packets of 188 bytes, the usual datagram of
 // mpegts over UDP: the player gets the restored chunks in such pieces rather
 // than as one datagram per chunk, which would exceed the MTU of anything but
 // loopback and the default buffers of players like ffplay.
 const playerDatagramSize = 7 * 188
 
-// play sends the restored stream to the player.
-func (c *Client) play(player net.Conn, decoderOut <-chan []byte) {
-	for data := range decoderOut {
+// play sends the restored stream to the player and takes the end-to-end delay
+// of every chunk.
+func (c *Client) play(player net.Conn, decoderOut <-chan codec.DecodedChunk) {
+	for chunk := range decoderOut {
+		if serverNow, ok := c.serverNow(); ok {
+			c.e2eDelays.add(codec.InputDelay(chunk.InputUnixMilli, serverNow))
+		}
+		var data = chunk.Data
 		for len(data) > 0 {
 			var piece = data[:min(len(data), playerDatagramSize)]
 			data = data[len(piece):]

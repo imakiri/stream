@@ -169,7 +169,7 @@ func TestDispatcher(t *testing.T) {
 	var ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
-	decoder.resultQueue = make(chan []byte, 8)
+	decoder.resultQueue = make(chan DecodedChunk, 8)
 	decoder.dispatchQueue = make(chan *Chunk, 4)
 	go decoder.dispatch(ctx)
 
@@ -196,23 +196,23 @@ func TestDispatcher(t *testing.T) {
 	decoder.dispatchQueue <- chunk
 	t.Log("sent chunk: data ", string(chunk.Data()))
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(1)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(2)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(3)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(4)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(5)), data)
 
@@ -238,23 +238,23 @@ func TestDispatcher(t *testing.T) {
 	t.Log("sent chunk: data ", string(chunk.Data()))
 	decoder.dispatchQueue <- chunk
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(6)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(7)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(8)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(9)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(10)), data)
 
@@ -284,23 +284,23 @@ func TestDispatcher(t *testing.T) {
 	t.Log("sent chunk: data ", string(chunk.Data()))
 	decoder.dispatchQueue <- chunk
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(12)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(13)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(14)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(15)), data)
 
-	data = <-decoder.resultQueue
+	data = (<-decoder.resultQueue).Data
 	t.Log("received chunk: data ", string(data))
 	assert.EqualValues(t, []byte(strconv.Itoa(16)), data)
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"github.com/stretchr/testify/require"
 	"testing"
+	"time"
 )
 
 func TestChunk(t *testing.T) {
@@ -52,4 +53,16 @@ func TestChunk(t *testing.T) {
 	require.EqualValues(t, PacketV2DataSize, chunk.size)
 	require.EqualValues(t, parts, chunk.Parts())
 	require.EqualValues(t, data[:PacketV2DataSize], chunk.data)
+}
+
+// TestInputDelayWraps checks the delay across the wrap of the 32-bit
+// millisecond clock.
+func TestInputDelayWraps(t *testing.T) {
+	var now = time.UnixMilli(1<<32 + 5)
+	if got := InputDelay(1<<32-10, now); got != 15*time.Millisecond {
+		t.Fatalf("delay across the wrap: %s, want 15ms", got)
+	}
+	if got := InputDelay(uint32(now.UnixMilli())+20, now); got != -20*time.Millisecond {
+		t.Fatalf("input after now: %s, want -20ms", got)
+	}
 }

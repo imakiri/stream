@@ -100,15 +100,18 @@ func TestCodec(t *testing.T) {
 	}()
 
 	go func() {
-		var data []byte
 		for i := 0; i < chunks; i++ {
 			select {
 			case <-ctx.Done():
 				return
-			case data = <-decoderOut:
-				var n, err = got.Write(data)
+			case chunk := <-decoderOut:
+				var n, err = got.Write(chunk.Data)
 				require.NoError(t, err)
-				require.EqualValues(t, len(data), n)
+				require.EqualValues(t, len(chunk.Data), n)
+				// the encoder stamps every chunk with when its data came in
+				var delay = InputDelay(chunk.InputUnixMilli, time.Now())
+				require.GreaterOrEqual(t, delay, time.Duration(0))
+				require.Less(t, delay, 5*time.Second)
 			}
 		}
 		wg.Done()
