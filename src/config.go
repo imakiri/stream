@@ -19,13 +19,16 @@ type relayConfigFile struct {
 	Network string `toml:"network"` // "udp" (default) or "tcp"
 }
 
-// proxyConfigFile is the [proxy] section: [proxy.socks5] or
+// proxyConfigFile is the [proxy] section: [proxy.socks5], [proxy.http] or
 // [proxy.amneziawg], at most one. TOML has no union types, so each kind is
 // a sub-table and an absent one decodes to nil.
 type proxyConfigFile struct {
 	Socks5 *struct {
 		URL string `toml:"url"`
 	} `toml:"socks5"`
+	HTTP *struct {
+		URL string `toml:"url"`
+	} `toml:"http"`
 	AmneziaWG *struct {
 		Config string `toml:"config"` // path, relative to the directory of the config file
 	} `toml:"amneziawg"`
@@ -37,6 +40,9 @@ func relayConfig(relay relayConfigFile, proxy proxyConfigFile, configPath string
 	var cfg = RelayConfig{Network: RelayNetwork(relay.Network), Addr: relay.Addr, Port: relay.Port}
 	if proxy.Socks5 != nil {
 		cfg.Proxy.Socks5 = &Socks5ProxyConfig{URL: proxy.Socks5.URL}
+	}
+	if proxy.HTTP != nil {
+		cfg.Proxy.HTTP = &HTTPProxyConfig{URL: proxy.HTTP.URL}
 	}
 	if proxy.AmneziaWG != nil {
 		var path = proxy.AmneziaWG.Config

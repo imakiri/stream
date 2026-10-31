@@ -70,6 +70,8 @@ link can go through a proxy, set in the `[proxy]` section of the config
 - `[proxy.socks5] url = "socks5://127.0.0.1:2080"`: a SOCKS5 proxy such as a
   local sing-box, TCP only. Over TCP a lost packet is resent rather than
   skipped, so losses turn into stalls and delay instead of FEC repairs.
+- `[proxy.http] url = "http://127.0.0.1:8080"`: an HTTP CONNECT proxy, TCP
+  only. Credentials in the URL become a `Proxy-Authorization` header.
 - `[proxy.amneziawg] config = "amneziawg.conf"`: an AmneziaWG tunnel
   (WireGuard with obfuscation against DPI) run inside the program
   (`src/amneziawg`, on `amneziawg-go` and the gVisor network stack), UDP or
@@ -324,7 +326,7 @@ relay.
 | `cmd/server`, `src/server.go` | the source |
 | `cmd/client`, `src/client.go` | the viewer |
 | `src/link.go` | `RelayLink`: connection to the relay, keepalive, reconnects |
-| `src/proxy.go`, `src/amneziawg` | the way to the relay through a socks5 proxy or an AmneziaWG tunnel |
+| `src/proxy.go`, `src/amneziawg` | the way to the relay through a socks5/http proxy or an AmneziaWG tunnel |
 | `src/wire` | packet kinds, certificates, handshake, data packet sealing |
 | `src/codec` | FEC encoder and decoder |
 | `src/frame` | packet framing over TCP |
