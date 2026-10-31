@@ -58,11 +58,10 @@ type Client struct {
 	// lastHelloSentUnixNano is when the latest client hello went out; the
 	// server hello that answers it gives the round trip for the clock offset.
 	lastHelloSentUnixNano atomic.Int64
-	// serverClockOffsetNanos is the server clock minus the client clock,
-	// estimated at the handshake; valid once serverClockKnown is set.
-	serverClockOffsetNanos atomic.Int64
-	serverClockKnown       atomic.Bool
-	e2eDelays              e2eDelays
+	// serverClock is the server clock estimated at the last handshake;
+	// nil before the first.
+	serverClock atomic.Pointer[serverClockSync]
+	e2eDelays   e2eDelays
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -215,27 +214,37 @@ func (c *Client) receive(ctx context.Context, link io.Reader, decoderIn chan<- [
 	}
 }
 
-// syncServerClock estimates the server clock offset from a server hello
-// stamped at serverClock and received at receivedAt, NTP style: the server
-// answered half a round trip before receivedAt. The error is the asymmetry of
-// the path, at most half the round trip. The round trip is taken from the
-// latest client hello, which is right while it is shorter than
-// clientHelloRetryInterval. It returns the estimate for the log.
+// serverClockSync is the server clock at one moment of this client.
+type serverClockSync struct {
+	server time.Time // the server clock, no monotonic reading
+	local  time.Time // the same moment here, with Go's monotonic reading
+}
+
+// syncServerClock estimates the server clock from a server hello stamped at
+// serverClock and received at receivedAt, NTP style: the server answered half
+// a round trip before receivedAt. The error is the asymmetry of the path, at
+// most half the round trip. The round trip is taken from the latest client
+// hello, which is right while it is shorter than clientHelloRetryInterval. It
+// returns the estimate for the log.
 func (c *Client) syncServerClock(serverClock, receivedAt time.Time) string {
 	var roundTrip = receivedAt.Sub(time.Unix(0, c.lastHelloSentUnixNano.Load()))
-	var offset = serverClock.Add(roundTrip / 2).Sub(receivedAt)
-	c.serverClockOffsetNanos.Store(int64(offset))
-	c.serverClockKnown.Store(true)
+	var sync = serverClockSync{server: serverClock.Add(roundTrip / 2), local: receivedAt}
+	c.serverClock.Store(&sync)
 	return fmt.Sprintf("server clock minus this clock %s ± %s (handshake round trip %s)",
-		offset.Round(time.Millisecond), (roundTrip / 2).Round(time.Millisecond), roundTrip.Round(time.Millisecond))
+		sync.server.Sub(receivedAt.Round(0)).Round(time.Millisecond), (roundTrip / 2).Round(time.Millisecond), roundTrip.Round(time.Millisecond))
 }
 
 // serverNow returns the current time by the server clock, if it is known.
+// It counts from the last handshake on the monotonic clock, not on this
+// machine's wall clock: a wall clock set after the handshake, as Windows
+// time sync does, would shift every delay by the step, and a step of more
+// than the delay made the delays negative.
 func (c *Client) serverNow() (time.Time, bool) {
-	if !c.serverClockKnown.Load() {
+	var sync = c.serverClock.Load()
+	if sync == nil {
 		return time.Time{}, false
 	}
-	return time.Now().Add(time.Duration(c.serverClockOffsetNanos.Load())), true
+	return sync.server.Add(time.Since(sync.local)), true
 }
 
 // reportStream logs the end-to-end delay and the lost chunks every

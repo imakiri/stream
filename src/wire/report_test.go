@@ -59,6 +59,13 @@ func TestClientReportRoundTrip(t *testing.T) {
 	if bytes.Contains(packet, testReport.marshal()) {
 		t.Fatal("the report is in the clear")
 	}
+
+	// a client whose estimate of the server clock is off reports negative
+	// delays; they must come through as such, not as zero
+	var skewed = ClientReport{DelayP50: -40 * time.Millisecond, DelayP99: -2 * time.Millisecond, DelayMax: 5 * time.Millisecond, Chunks: 10}
+	if report, err = opener.OpenClientReport(sealer.SealClientReport(skewed)); err != nil || report != skewed {
+		t.Fatalf("got %+v, %v, want %+v", report, err, skewed)
+	}
 }
 
 // TestClientReportKeyOfTheAnswerTaken answers the same client hello twice,

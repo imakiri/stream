@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,7 +41,9 @@ import (
 //	2..18   client ID: the relay checks it is the sender
 //	18..26  report key ID
 //	26..34  report number, big endian: the AEAD nonce, increasing per key
-//	34..58  ClientReport, sealed with the report key
+//	34..58  ClientReport, sealed with the report key: the three delays as
+//	        signed 32-bit microseconds, then chunks, lost and incomplete as
+//	        unsigned 32-bit numbers, all big endian
 //	58..74  AEAD tag
 //
 // Bytes 0..34 are authenticated as additional data.
@@ -55,17 +58,20 @@ const (
 
 // ClientReport is what a client tells the server about the stream.
 type ClientReport struct {
-	DelayP50, DelayP99, DelayMax time.Duration // end-to-end, from the server's input to the client's output
-	Chunks                       uint32        // chunks the delays are over
-	Lost                         uint32        // chunks lost
-	Incomplete                   uint32        // of the lost, those that came short of packets
+	// end-to-end, from the server's input to the client's output; negative
+	// when the client's estimate of the server clock is off by more than
+	// the delay
+	DelayP50, DelayP99, DelayMax time.Duration
+	Chunks                       uint32 // chunks the delays are over
+	Lost                         uint32 // chunks lost
+	Incomplete                   uint32 // of the lost, those that came short of packets
 }
 
 func (r ClientReport) marshal() []byte {
 	var b = make([]byte, clientReportPayloadSize)
-	binary.BigEndian.PutUint32(b[0:4], durationMicros(r.DelayP50))
-	binary.BigEndian.PutUint32(b[4:8], durationMicros(r.DelayP99))
-	binary.BigEndian.PutUint32(b[8:12], durationMicros(r.DelayMax))
+	binary.BigEndian.PutUint32(b[0:4], uint32(durationMicros(r.DelayP50)))
+	binary.BigEndian.PutUint32(b[4:8], uint32(durationMicros(r.DelayP99)))
+	binary.BigEndian.PutUint32(b[8:12], uint32(durationMicros(r.DelayMax)))
 	binary.BigEndian.PutUint32(b[12:16], r.Chunks)
 	binary.BigEndian.PutUint32(b[16:20], r.Lost)
 	binary.BigEndian.PutUint32(b[20:24], r.Incomplete)
@@ -74,25 +80,19 @@ func (r ClientReport) marshal() []byte {
 
 func parseClientReport(b []byte) ClientReport {
 	return ClientReport{
-		DelayP50:   time.Duration(binary.BigEndian.Uint32(b[0:4])) * time.Microsecond,
-		DelayP99:   time.Duration(binary.BigEndian.Uint32(b[4:8])) * time.Microsecond,
-		DelayMax:   time.Duration(binary.BigEndian.Uint32(b[8:12])) * time.Microsecond,
+		DelayP50:   time.Duration(int32(binary.BigEndian.Uint32(b[0:4]))) * time.Microsecond,
+		DelayP99:   time.Duration(int32(binary.BigEndian.Uint32(b[4:8]))) * time.Microsecond,
+		DelayMax:   time.Duration(int32(binary.BigEndian.Uint32(b[8:12]))) * time.Microsecond,
 		Chunks:     binary.BigEndian.Uint32(b[12:16]),
 		Lost:       binary.BigEndian.Uint32(b[16:20]),
 		Incomplete: binary.BigEndian.Uint32(b[20:24]),
 	}
 }
 
-// durationMicros clamps d to what 32 bits of microseconds hold (71 min).
-func durationMicros(d time.Duration) uint32 {
-	var micros = d.Microseconds()
-	if micros < 0 {
-		return 0
-	}
-	if micros > 1<<32-1 {
-		return 1<<32 - 1
-	}
-	return uint32(micros)
+// durationMicros clamps d to what 32 signed bits of microseconds hold
+// (±35 min).
+func durationMicros(d time.Duration) int32 {
+	return int32(max(math.MinInt32, min(math.MaxInt32, d.Microseconds())))
 }
 
 // ClientReportClientID returns the client a report says it comes from, for
