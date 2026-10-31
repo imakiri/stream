@@ -8,7 +8,8 @@ import (
 const ChunkHeaderSize = 22
 
 type Chunk struct {
-	parts uint64
+	parts   uint64
+	session uint64 // not on the wire: taken from the packets the chunk was restored from
 
 	version uint8  // 0...1
 	kind    uint8  // 1...2
@@ -84,6 +85,15 @@ func (c *Chunk) Unmarshal(data [][]byte) bool {
 	//c.id = binary.LittleEndian.Uint32(data[i][2:6])
 	c.csn = binary.LittleEndian.Uint64(data[i][6:14])
 	c.size = binary.LittleEndian.Uint64(data[i][14:22])
+	// size comes from restored bytes; a chunk mixed from foreign packets would
+	// make it garbage, so bound it by what the parts can hold before allocating.
+	var capacity uint64
+	for i := range data {
+		capacity += uint64(len(data[i]))
+	}
+	if len(data[0]) < ChunkHeaderSize || c.size > capacity-ChunkHeaderSize {
+		return false
+	}
 	c.data = make([]byte, c.size)
 
 	var copied = copy(c.data, data[i][ChunkHeaderSize:])

@@ -2,6 +2,8 @@ package codec
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"github.com/go-faster/errors"
 	"github.com/klauspost/reedsolomon"
@@ -18,10 +20,11 @@ type Encoder struct {
 		buf     []byte
 	}
 	encoder struct {
-		rs    reedsolomon.Encoder
-		total uint64
-		data  uint64
-		csn   uint64
+		rs      reedsolomon.Encoder
+		total   uint64
+		data    uint64
+		csn     uint64
+		session uint64 // random per Encode call, see PacketV2.session
 	}
 	dispatcher struct {
 		length uint64
@@ -64,14 +67,6 @@ func NewEncoder(aggrtTimeout time.Duration, dispatcherSize, dataParts, totalPart
 	return encoder, nil
 }
 
-func (encoder *Encoder) close(ctx context.Context) {
-	<-ctx.Done()
-	close(encoder.aggregateQueue)
-	close(encoder.dispatcherQueue)
-	close(encoder.encodeQueue)
-	close(encoder.resultQueue)
-}
-
 func (encoder *Encoder) IncomingSize() uint64 {
 	return PacketV2DataSize*encoder.encoder.data - ChunkHeaderSize
 }
@@ -96,7 +91,9 @@ func (encoder *Encoder) aggregatorFlush(ctx context.Context) {
 }
 
 func (encoder *Encoder) dispatch(ctx context.Context) {
+	defer close(encoder.resultQueue)
 	var packet *PacketV2
+	var ok bool
 	var chunks = encoder.dispatcher.chunks
 	var perChunk = encoder.encoder.total
 	var size = chunks * perChunk
@@ -105,7 +102,10 @@ func (encoder *Encoder) dispatch(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case packet = <-encoder.dispatcherQueue:
+		case packet, ok = <-encoder.dispatcherQueue:
+			if !ok {
+				return
+			}
 			var at = ((chunks * encoder.dispatcher.length) + (encoder.dispatcher.length / perChunk)) % size
 			encoder.dispatcher.buf[at] = packet
 			encoder.dispatcher.length++
@@ -129,17 +129,22 @@ func (encoder *Encoder) dispatch(ctx context.Context) {
 }
 
 func (encoder *Encoder) encode(ctx context.Context) {
+	defer close(encoder.dispatcherQueue)
 	encoder.encoder.csn = 1
 	defer func() { encoder.encoder.csn = 0 }()
 	var err error
 	var data []byte
 	var packet *PacketV2
+	var ok bool
 encode:
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case data = <-encoder.encodeQueue:
+		case data, ok = <-encoder.encodeQueue:
+			if !ok {
+				return
+			}
 			var chunk, rem = NewChunk(encoder.encoder.data, encoder.encoder.csn, KindData, data)
 			if rem != nil {
 				log.Printf("encode: NewChunk: res is not nil: len %d", len(rem))
@@ -154,13 +159,7 @@ encode:
 			}
 
 			for i := range data {
-				var kind uint8
-				if encoder.encoder.csn == 1 {
-					kind = 2
-				} else {
-					kind = 1
-				}
-				packet, rem = NewPacketV2(kind, encoder.encoder.csn, uint32(i), AddrFec, data[i])
+				packet, rem = NewPacketV2(KindData, encoder.encoder.csn, uint32(i), encoder.encoder.session, data[i])
 				if rem != nil {
 					log.Printf("encode: NewPacketV2: res is not nil: len %d", len(rem))
 					continue
@@ -178,6 +177,7 @@ encode:
 }
 
 func (encoder *Encoder) aggregate(ctx context.Context) {
+	defer close(encoder.encodeQueue)
 	var data []byte
 	var sep int
 	//aggregate:
@@ -201,7 +201,27 @@ func (encoder *Encoder) aggregate(ctx context.Context) {
 	}
 }
 
-func (encoder *Encoder) Encode(ctx context.Context) (in, out chan []byte, err error) {
+// newSession returns a random non-zero session ID.
+func newSession() (uint64, error) {
+	var b [8]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, err
+		}
+		if session := binary.LittleEndian.Uint64(b[:]); session != 0 {
+			return session, nil
+		}
+	}
+}
+
+// Encode starts the encoder under a new session ID. The in channel is never
+// closed by the encoder, so writers may keep sending until ctx is done; out is
+// closed once the encoder has stopped after ctx is done.
+func (encoder *Encoder) Encode(ctx context.Context) (in chan<- []byte, out <-chan []byte, err error) {
+	encoder.encoder.session, err = newSession()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "newSession")
+	}
 	encoder.resultQueue = make(chan []byte, 8*encoder.dispatcher.chunks)
 	encoder.dispatcherQueue = make(chan *PacketV2, 8*encoder.dispatcher.chunks)
 	encoder.encodeQueue = make(chan []byte, 64*encoder.encoder.data)
@@ -210,6 +230,5 @@ func (encoder *Encoder) Encode(ctx context.Context) (in, out chan []byte, err er
 	go encoder.dispatch(ctx)
 	go encoder.aggregate(ctx)
 	go encoder.encode(ctx)
-	go encoder.close(ctx)
 	return encoder.aggregateQueue, encoder.resultQueue, nil
 }

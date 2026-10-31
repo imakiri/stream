@@ -235,12 +235,16 @@ func (client *Client) routeIn(ctx context.Context) {
 	}()
 	go func() {
 		var buf []byte
+		var ok bool
 		var err error
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case buf = <-decoderOut:
+			case buf, ok = <-decoderOut:
+				if !ok {
+					return
+				}
 				_, err = client.callerConn.Write(buf)
 				if err != nil {
 					log.Printf("routeIn: callerConn.Write: %v", err)
@@ -290,13 +294,17 @@ func (client *Client) routeOut(ctx context.Context) {
 		}
 	}()
 	go func() {
-		var buf = make([]byte, packetBufferSize)
+		var buf []byte
+		var ok bool
 		var err error
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case buf = <-encoderOut:
+			case buf, ok = <-encoderOut:
+				if !ok {
+					return
+				}
 				_, err = client.writer.Write(buf)
 				if err != nil {
 					log.Printf("routeOut: writer.Write: %v", err)

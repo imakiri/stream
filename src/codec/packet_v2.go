@@ -16,18 +16,18 @@ type PacketV2 struct {
 	_       uint16                 // 2...4
 	psn     uint32                 // 4...8  packet sequence number
 	csn     uint64                 // 8...16 chunk sequence number
-	addr    uint64                 // 16...24
+	session uint64                 // 16...24 random per encoder run, so the decoder notices a restarted sender
 	data    []byte                 // 24...1048
 	hash    [PacketV2HashSize]byte // 1048...1056
 }
 
-func NewPacketV2(kind uint8, csn uint64, psn uint32, addr uint64, data []byte) (*PacketV2, []byte) {
+func NewPacketV2(kind uint8, csn uint64, psn uint32, session uint64, data []byte) (*PacketV2, []byte) {
 	var packet = &PacketV2{
 		version: 2,
 		kind:    kind,
 		psn:     psn,
 		csn:     csn,
-		addr:    addr,
+		session: session,
 		data:    make([]byte, PacketV2DataSize),
 	}
 	var copied = copy(packet.data, data)
@@ -57,7 +57,7 @@ func (p *PacketV2) Marshal() []byte {
 	b[1] = p.kind
 	binary.LittleEndian.PutUint32(b[4:8], p.psn)
 	binary.LittleEndian.PutUint64(b[8:16], p.csn)
-	binary.LittleEndian.PutUint64(b[16:24], p.addr)
+	binary.LittleEndian.PutUint64(b[16:24], p.session)
 	copy(b[PacketV2HeaderSize:PacketV2HeaderSize+PacketV2DataSize], p.data[:])
 	var h = hash(b[:PacketV2HeaderSize+PacketV2DataSize])
 	copy(b[PacketV2HeaderSize+PacketV2DataSize:PacketV2Size], h[:])
@@ -72,7 +72,7 @@ func (p *PacketV2) Unmarshal(data []byte) bool {
 	p.kind = data[1]
 	p.psn = binary.LittleEndian.Uint32(data[4:8])
 	p.csn = binary.LittleEndian.Uint64(data[8:16])
-	p.addr = binary.LittleEndian.Uint64(data[16:24])
+	p.session = binary.LittleEndian.Uint64(data[16:24])
 	p.data = make([]byte, PacketV2DataSize)
 	copy(p.data[:], data[PacketV2HeaderSize:PacketV2HeaderSize+PacketV2DataSize])
 	copy(p.hash[:], data[PacketV2HeaderSize+PacketV2DataSize:PacketV2Size])

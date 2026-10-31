@@ -9,6 +9,8 @@ import (
 	"testing"
 )
 
+const testSession = 0x5e55_1011
+
 func requirePackets(t *testing.T, packets []*PacketV2, csn uint64, expect map[uint64]map[uint64][]byte) {
 	var expectPackets, ok = expect[csn]
 	if !ok {
@@ -41,7 +43,7 @@ func requirePackets(t *testing.T, packets []*PacketV2, csn uint64, expect map[ui
 
 func casePacket(csn, psn uint64, expect map[uint64]map[uint64][]byte) *PacketV2 {
 	var data = []byte(fmt.Sprintf("%d.%d", csn, psn))
-	var packet, _ = NewPacketV2(1, csn, uint32(psn), KindData, data)
+	var packet, _ = NewPacketV2(KindData, csn, uint32(psn), testSession, data)
 	if expect[csn] == nil {
 		expect[csn] = make(map[uint64][]byte)
 	}
@@ -127,7 +129,7 @@ func TestRestorer(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := range buf {
-		packet, rem = NewPacketV2(1, 1, uint32(i), AddrFec, buf[i])
+		packet, rem = NewPacketV2(KindData, 1, uint32(i), testSession, buf[i])
 		assert.Nil(t, rem)
 		packets[i] = packet
 	}
@@ -146,7 +148,7 @@ func TestRestorer(t *testing.T) {
 	assert.NoError(t, err)
 
 	for i := range buf {
-		packet, rem = NewPacketV2(1, 2, uint32(i), AddrFec, buf[i])
+		packet, rem = NewPacketV2(KindData, 2, uint32(i), testSession, buf[i])
 		assert.Nil(t, rem)
 		packets[i] = packet
 	}
