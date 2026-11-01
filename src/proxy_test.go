@@ -221,9 +221,6 @@ func TestProxyConfigIsChecked(t *testing.T) {
 			Socks5: &Socks5ProxyConfig{URL: "socks5://127.0.0.1:2080"},
 			HTTP:   &HTTPProxyConfig{URL: "http://127.0.0.1:8080"},
 		}}},
-		{"socks5 over udp", RelayConfig{Network: RelayNetworkUDP, Proxy: ProxyConfig{
-			Socks5: &Socks5ProxyConfig{URL: "socks5://127.0.0.1:2080"},
-		}}},
 		{"http over udp", RelayConfig{Network: RelayNetworkUDP, Proxy: ProxyConfig{
 			HTTP: &HTTPProxyConfig{URL: "http://127.0.0.1:8080"},
 		}}},

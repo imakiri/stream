@@ -25,8 +25,8 @@ type ProxyConfig struct {
 }
 
 // Socks5ProxyConfig reaches the relay through a SOCKS5 proxy, such as a
-// local sing-box. TCP only: UDP over SOCKS5 (UDP ASSOCIATE) is not
-// supported.
+// local sing-box: over TCP with CONNECT, over UDP with UDP ASSOCIATE (see
+// dialSocks5UDP), which the proxy must support.
 type Socks5ProxyConfig struct {
 	URL string // e.g. socks5://127.0.0.1:2080
 }
@@ -64,9 +64,6 @@ func (cfg ProxyConfig) validate(network RelayNetwork) error {
 	if n > 1 {
 		return errors.New("set one proxy at most: socks5, http or amneziawg")
 	}
-	if cfg.Socks5 != nil && network != RelayNetworkTCP {
-		return fmt.Errorf("the socks5 proxy works only over %q, relay network is %q", RelayNetworkTCP, network)
-	}
 	if cfg.HTTP != nil && network != RelayNetworkTCP {
 		return fmt.Errorf("the http proxy works only over %q, relay network is %q", RelayNetworkTCP, network)
 	}
@@ -90,7 +87,7 @@ func (cfg ProxyConfig) open(ctx context.Context) (proxyDialer, error) {
 		if !ok {
 			return nil, fmt.Errorf("socks5 dialer for %s does not support context", socksURL.Redacted())
 		}
-		return socks5Dialer{contextDialer}, nil
+		return socks5Dialer{tcp: contextDialer, proxyURL: socksURL}, nil
 	case cfg.HTTP != nil:
 		proxyURL, err := url.Parse(cfg.HTTP.URL)
 		if err != nil {
@@ -108,6 +105,12 @@ func (cfg ProxyConfig) open(ctx context.Context) (proxyDialer, error) {
 		if err != nil {
 			return nil, err
 		}
+		// TODO: route the relay's own address into the tunnel: resolve the
+		// relay host and add its IPs to the peer's AllowedIPs here, so the
+		// configs need not name the relay's public IP (now they list
+		// 89.44.198.165/32 by hand, to reach imakiri.one through the tunnel
+		// under the same address as without it, and must follow it if the
+		// VPS changes its IP).
 		tunnel, err := amneziawg.Open(ctx, tunnelConfig)
 		if err != nil {
 			return nil, err
@@ -137,8 +140,20 @@ func (cfg ProxyConfig) String() string {
 	}
 }
 
+// socks5Dialer dials TCP through the proxy with x/net/proxy, UDP with
+// dialSocks5UDP.
 type socks5Dialer struct {
-	proxy.ContextDialer
+	tcp      proxy.ContextDialer
+	proxyURL *url.URL
+}
+
+func (d socks5Dialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+		return dialSocks5UDP(ctx, d.proxyURL, addr)
+	default:
+		return d.tcp.DialContext(ctx, network, addr)
+	}
 }
 
 func (socks5Dialer) Close() error { return nil }
