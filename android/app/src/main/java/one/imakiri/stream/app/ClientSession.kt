@@ -6,12 +6,26 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import one.imakiri.stream.streammobile.Listener
+import one.imakiri.stream.streammobile.Profile
 import one.imakiri.stream.streammobile.Session
 import one.imakiri.stream.streammobile.Streammobile
 import java.io.File
 
 /** The profile directory: client.cfg, the AmneziaWG config, client.key, client.enrollment. */
 fun profileDir(context: Context): File = File(context.filesDir, "profile")
+
+/**
+ * The saved profile, or null if there is none. A saved client.cfg that does
+ * not load counts as none too (one of an older app, e.g. with the [fec] keys
+ * of the codec before 2026-11-01, made the app crash at start), so the app
+ * asks for the profile again; savedProfileError tells why. The key and the
+ * enrollment are files of their own and stay.
+ */
+fun savedProfile(dir: File): Profile? = runCatching { Streammobile.loadProfile(dir.path) }.getOrNull()
+
+/** Why the saved client.cfg does not load; null if it loads or there is none. */
+fun savedProfileError(dir: File): String? =
+    runCatching { Streammobile.loadProfile(dir.path) }.exceptionOrNull()?.let { it.message ?: it.toString() }
 
 /** Name the imported AmneziaWG config gets in the profile directory. */
 const val AMNEZIAWG_CONFIG_FILE = "amneziawg.conf"

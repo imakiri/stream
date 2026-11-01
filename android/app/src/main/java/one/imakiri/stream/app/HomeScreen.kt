@@ -34,7 +34,7 @@ import one.imakiri.stream.streammobile.Streammobile
 fun HomeScreen(onPlay: () -> Unit, onSettings: () -> Unit, onDeleted: () -> Unit) {
     val context = LocalContext.current
     val dir = profileDir(context)
-    val profile = remember { Streammobile.loadProfile(dir.path) }
+    val profile = remember { savedProfile(dir) }
     val enrolledAs = remember { runCatching { Streammobile.enrolledAs(dir.path) }.getOrElse { it.message ?: "" } }
     var confirmDelete by remember { mutableStateOf(false) }
 

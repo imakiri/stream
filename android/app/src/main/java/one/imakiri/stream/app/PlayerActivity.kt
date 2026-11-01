@@ -62,7 +62,11 @@ class PlayerActivity : ComponentActivity() {
         }
 
         val dir = profileDir(this)
-        val profile = Streammobile.loadProfile(dir.path)
+        val profile = savedProfile(dir) ?: run {
+            Toast.makeText(this, "no profile: ${savedProfileError(dir) ?: "set one up first"}", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         try {
             ClientSession.start(dir)
         } catch (e: Exception) {

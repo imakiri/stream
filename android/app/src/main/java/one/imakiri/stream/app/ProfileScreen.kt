@@ -75,9 +75,11 @@ fun ProfileScreen(editing: Boolean, onSaved: () -> Unit) {
     var generation by remember { mutableStateOf(0) }
     var imported by remember { mutableStateOf<Profile?>(null) }
     val form = remember(generation) {
-        ProfileForm(imported ?: Streammobile.loadProfile(dir.path) ?: Streammobile.defaultProfile())
+        ProfileForm(imported ?: savedProfile(dir) ?: Streammobile.defaultProfile())
     }
-    var message by remember { mutableStateOf<String?>(null) }
+    var message by remember {
+        mutableStateOf(savedProfileError(dir)?.let { "the saved profile does not load, import client.cfg again: $it" })
+    }
 
     val importConfig = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult

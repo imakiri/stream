@@ -34,8 +34,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge() // status bar icons that follow the theme
         val dir = profileDir(this)
         val start = when {
-            Streammobile.loadProfile(dir.path) == null -> Route.SETUP
-            Streammobile.enrolledAs(dir.path).isEmpty() -> Route.ENROLL
+            savedProfile(dir) == null -> Route.SETUP
+            !isEnrolled(dir.path) -> Route.ENROLL
             else -> Route.HOME
         }
         setContent {
@@ -77,9 +77,13 @@ private fun StreamNavigation(start: String) {
 }
 
 private fun nextAfterProfile(context: android.content.Context): String =
-    if (Streammobile.enrolledAs(profileDir(context).path).isEmpty()) Route.ENROLL else Route.HOME
+    if (!isEnrolled(profileDir(context).path)) Route.ENROLL else Route.HOME
 
 /** Goes to route, dropping the screen it leaves from the back stack. */
 private fun NavHostController.after(leaving: String, route: String) {
     navigate(route) { popUpTo(leaving) { inclusive = true } }
 }
+
+/** Whether dir holds an enrollment that loads; one that does not is asked for again. */
+private fun isEnrolled(dir: String): Boolean =
+    runCatching { Streammobile.enrolledAs(dir) }.getOrDefault("").isNotEmpty()
