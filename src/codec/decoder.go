@@ -1,56 +1,85 @@
 package codec
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"sync/atomic"
+	"time"
+
 	"github.com/go-faster/errors"
 	"github.com/imakiri/stream/src/latencytrace"
 	"github.com/klauspost/reedsolomon"
-	"log"
-	"slices"
-	"sync/atomic"
-	"time"
 )
 
-// assemblyLine collects the packets of one chunk. Lines form a ring indexed by
-// csn % len(lines); a line is reused when a packet of a newer csn lands on it.
-type assemblyLine struct {
-	csn   uint64
-	found uint64
-	// restored is set once the line had enough packets and went to the
-	// restorer; the remaining parity packets of this csn are then surplus.
+// openBlock collects the packets of a block being received (the current or
+// the previous one, see Decoder.assembler); the layout is in packet.go.
+type openBlock struct {
+	id uint64
+	// k and m are the block's data and parity packets; 0 until a parity
+	// packet tells them
+	k, m int
+	// shards by index: data shards as they came (short), parity full
+	shards [][]byte
+	found  int
+	// restored: the parity has been used, every chunk that could be made
+	// is out; later packets of the block are surplus
 	restored bool
-	packets  []*PacketV2
+	// givenUp: given up (or never opened); its chunks not out are lost
+	givenUp bool
+	// pieces of each chunk of the block by csn, and the chunks sent on
+	pieces    map[uint64][][]byte
+	delivered map[uint64]bool
 }
 
-func (line *assemblyLine) reuse(csn uint64) {
-	line.csn = csn
-	line.found = 0
-	line.restored = false
-	clear(line.packets)
+func newOpenBlock() openBlock {
+	return openBlock{shards: make([][]byte, maxBlockShards), pieces: make(map[uint64][][]byte), delivered: make(map[uint64]bool), givenUp: true}
+}
+
+func (b *openBlock) reset(id uint64) {
+	b.id = id
+	b.givenUp = id == 0
+	b.k, b.m = 0, 0
+	clear(b.shards)
+	b.found = 0
+	b.restored = false
+	clear(b.pieces)
+	clear(b.delivered)
+}
+
+// dispatchItem is what the assembler hands the dispatcher: a chunk, or the
+// news that every chunk of session before csn lostBefore that has not come
+// will not come.
+type dispatchItem struct {
+	chunk      *Chunk
+	session    uint64
+	lostBefore uint64
 }
 
 type Decoder struct {
+	// ReorderDeadline, when not zero, is how long restored chunks wait for
+	// a missing chunk before it: then it is given up and they go on. The
+	// assembler gives a block's missing chunks up as soon as a few packets
+	// of the next block have come (all of the block was sent before it); the
+	// deadline is for when nothing comes after the loss. Without it a
+	// missing chunk is given up only when dispatcherSize newer chunks have
+	// come. Set it before Decode.
+	ReorderDeadline time.Duration
+
 	// trace records when each chunk is restored; nil records nothing. It
 	// may be set while the decoder runs, see SetTrace.
 	trace atomic.Pointer[latencytrace.Trace]
 
 	assembler struct {
-		lines []assemblyLine
-		// maxCsn is the newest csn seen in the session; packets older than
-		// the ring (csn + len(lines) <= maxCsn) can no longer have a line.
-		maxCsn uint64
+		// current is the newest block packets came of; previous the one
+		// before it, still taking packets that come late until current has
+		// blockReorderTolerance packets, see takePacket
+		current, previous openBlock
 		// session is the encoder run the packets are taken from; packets of
 		// previousSession are late leftovers of a restarted sender.
 		session         uint64
 		previousSession uint64
-
-		ok  *uint64
-		err *uint64
-	}
-	restorer struct {
-		rs    reedsolomon.Encoder
-		total uint64
-		data  uint64
+		codes           map[[2]int]reedsolomon.Encoder
 
 		ok  *uint64
 		err *uint64
@@ -62,28 +91,29 @@ type Decoder struct {
 		last     uint64
 		awaiting uint64
 		chunks   []*Chunk
+		// waitingSince is when restored chunks started to wait for a
+		// missing one before them; zero while none wait.
+		waitingSince time.Time
 
 		ok  *uint64
 		err *uint64
 	}
 
 	// lostChunks counts the chunks the dispatcher skipped in the stream;
-	// incompleteChunks those of them the assembler gave up on with too few
-	// packets to restore. See Losses.
+	// incompleteChunks those of them some packets of which came, too few
+	// to restore. See Losses.
 	lostChunks       atomic.Uint64
 	incompleteChunks atomic.Uint64
 
 	argumentQueue chan []byte
-	assemblyQueue chan *PacketV2
-	restoreQueue  chan []*PacketV2
-	dispatchQueue chan *Chunk
+	assemblyQueue chan *Packet
+	dispatchQueue chan dispatchItem
 	resultQueue   chan DecodedChunk
 }
 
 // Losses returns the chunks lost since the decoder started: lost counts the
 // chunks skipped in the stream, incomplete those of them that came with too
-// few packets to restore (the others did not come at all). Burst losses on
-// the network show as several incomplete chunks of one interleave group.
+// few packets to restore (the others did not come at all).
 func (decoder *Decoder) Losses() (lost, incomplete uint64) {
 	return decoder.lostChunks.Load(), decoder.incompleteChunks.Load()
 }
@@ -108,17 +138,12 @@ func decoded(chunk *Chunk) DecodedChunk {
 	return DecodedChunk{Data: chunk.Data(), Session: chunk.session, CSN: chunk.csn, InputUnixMilli: chunk.inputUnixMilli}
 }
 
-func NewDecoder(dataParts, totalParts, assemblerLines, dispatcherSize uint64) (decoder *Decoder, err error) {
-	if dataParts == 0 {
-		return nil, errors.New("dataParts cannot be zero")
+// NewDecoder makes a decoder that puts restored chunks back in order in a
+// window of dispatcherSize chunks.
+func NewDecoder(dispatcherSize uint64) (decoder *Decoder, err error) {
+	if dispatcherSize == 0 {
+		return nil, errors.New("dispatcherSize cannot be zero")
 	}
-	if totalParts < 2 {
-		return nil, errors.New("totalParts cannot be less than 2")
-	}
-	if assemblerLines == 0 {
-		return nil, errors.New("assemblerLines cannot be zero")
-	}
-
 	decoder = new(Decoder)
 	decoder.dispatcher.size = dispatcherSize
 	decoder.dispatcher.awaiting = 1
@@ -126,186 +151,201 @@ func NewDecoder(dataParts, totalParts, assemblerLines, dispatcherSize uint64) (d
 	decoder.dispatcher.ok = new(uint64)
 	decoder.dispatcher.err = new(uint64)
 
-	decoder.restorer.rs, err = reedsolomon.New(int(dataParts), int(totalParts)-int(dataParts))
-	if err != nil {
-		return nil, err
-	}
-	decoder.restorer.data = dataParts
-	decoder.restorer.total = totalParts
-	decoder.restorer.ok = new(uint64)
-	decoder.restorer.err = new(uint64)
-
-	decoder.assembler.lines = make([]assemblyLine, assemblerLines)
-	for i := range decoder.assembler.lines {
-		decoder.assembler.lines[i].packets = make([]*PacketV2, totalParts)
-	}
+	decoder.assembler.current = newOpenBlock()
+	decoder.assembler.previous = newOpenBlock()
+	decoder.assembler.codes = make(map[[2]int]reedsolomon.Encoder)
 	decoder.assembler.ok = new(uint64)
 	decoder.assembler.err = new(uint64)
-
 	return decoder, nil
 }
 
-// resetDispatcher starts ordering chunks of a new session. Interleaved chunks
-// complete out of order, so the first chunk seen is not necessarily the first
-// one sent: if it is within the reorder window from the start, the encoder has
-// just started and csn 1 is awaited; otherwise the decoder joined a running
-// stream and starts from this chunk, losing at most the few before it.
-func (decoder *Decoder) resetDispatcher(chunk *Chunk) {
+// resetDispatcher starts ordering chunks of a new session from the first
+// news of it: chunk csn, or the chunks before csn given up. Chunks restored
+// from parity come after the chunks behind them, so the first chunk seen is
+// not necessarily the first one sent: if csn is within the reorder window from
+// the start, the encoder has just started and csn 1 is awaited; otherwise the
+// decoder joined a running stream and starts from csn, losing at most the few
+// before it.
+func (decoder *Decoder) resetDispatcher(session, csn uint64) {
 	var awaiting uint64 = 1
-	if chunk.csn > decoder.dispatcher.size {
-		awaiting = chunk.csn
+	if csn > decoder.dispatcher.size {
+		awaiting = csn
 	}
-	log.Printf("dispatch: new session %x awaiting csn %d", chunk.session, awaiting)
-	decoder.dispatcher.session = chunk.session
+	log.Printf("dispatch: new session %x awaiting csn %d", session, awaiting)
+	decoder.dispatcher.session = session
 	decoder.dispatcher.awaiting = awaiting
 	decoder.dispatcher.first = awaiting - 1
 	decoder.dispatcher.last = awaiting - 1
 	clear(decoder.dispatcher.chunks)
+	decoder.dispatcher.waitingSince = time.Time{}
 }
 
-func (decoder *Decoder) dispatch(ctx context.Context) {
-	defer close(decoder.resultQueue)
-	var chunk *Chunk
-	var ok bool
-dispatch:
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case chunk, ok = <-decoder.dispatchQueue:
-			if !ok {
-				return
-			}
-			if chunk == nil {
-				log.Println("dispatch: dropping invalid chunk: nil chunk")
-				atomic.AddUint64(decoder.dispatcher.err, 1)
-				continue dispatch
-			}
-
-			if chunk.csn == 0 {
-				log.Println("dispatch: dropping invalid chunk: csn == 0")
-				atomic.AddUint64(decoder.dispatcher.err, 1)
-				continue dispatch
-			}
-
-			if chunk.session != decoder.dispatcher.session {
-				decoder.resetDispatcher(chunk)
-			}
-
-			if chunk.csn <= decoder.dispatcher.last {
-				log.Printf("dispatch: detached chunk: csn: %d", chunk.csn)
-				atomic.AddUint64(decoder.dispatcher.err, 1)
-				continue dispatch
-			}
-
-			decoder.dispatcher.first = max(decoder.dispatcher.first, chunk.csn)
-
-			if chunk.csn != decoder.dispatcher.awaiting {
-				var at = chunk.csn % decoder.dispatcher.size
-				if decoder.dispatcher.chunks[at] != nil {
-					decoder.lostChunks.Add(decoder.dispatcher.chunks[at].csn - decoder.dispatcher.awaiting)
-					atomic.AddUint64(decoder.dispatcher.err, 1)
-					select {
-					case <-ctx.Done():
-						return
-					case decoder.resultQueue <- decoded(decoder.dispatcher.chunks[at]):
-						decoder.dispatcher.last = decoder.dispatcher.chunks[at].csn
-						decoder.dispatcher.awaiting = decoder.dispatcher.chunks[at].csn + 1
-					}
-					decoder.dispatcher.chunks[at] = chunk
-				} else {
-					decoder.dispatcher.chunks[at] = chunk
-					atomic.AddUint64(decoder.dispatcher.ok, 1)
-					continue dispatch
-				}
-			} else {
-				select {
-				case <-ctx.Done():
-					return
-				case decoder.resultQueue <- decoded(chunk):
-					decoder.dispatcher.last = chunk.csn
-					decoder.dispatcher.awaiting++
-				}
-			}
-
-			var length = decoder.dispatcher.first - decoder.dispatcher.last
-			if length == 0 {
-				atomic.AddUint64(decoder.dispatcher.ok, 1)
-				continue dispatch
-			}
-
-			for i := decoder.dispatcher.last; i < decoder.dispatcher.first; i++ {
-				var at = (i + 1) % decoder.dispatcher.size
-				if decoder.dispatcher.chunks[at] == nil {
-					atomic.AddUint64(decoder.dispatcher.ok, 1)
-					continue dispatch
-				}
-				if decoder.dispatcher.chunks[at].csn != decoder.dispatcher.awaiting {
-					atomic.AddUint64(decoder.dispatcher.ok, 1)
-					continue dispatch
-				}
-
-				select {
-				case <-ctx.Done():
-					return
-				case decoder.resultQueue <- decoded(decoder.dispatcher.chunks[at]):
-					decoder.dispatcher.last = decoder.dispatcher.chunks[at].csn
-					decoder.dispatcher.awaiting++
-					decoder.dispatcher.chunks[at] = nil
-				}
-			}
-			atomic.AddUint64(decoder.dispatcher.ok, 1)
+// dropSkippedChunks drops the chunks in the window a slot collision has
+// already skipped past: older than the awaited one, they can never go on.
+func (decoder *Decoder) dropSkippedChunks() {
+	for at, held := range decoder.dispatcher.chunks {
+		if held != nil && held.csn < decoder.dispatcher.awaiting {
+			decoder.dispatcher.chunks[at] = nil
 		}
 	}
 }
 
-func (decoder *Decoder) restore(ctx context.Context) {
-	defer close(decoder.dispatchQueue)
-	var packets []*PacketV2
-	var data = make([][]byte, decoder.restorer.total)
-	var chunk *Chunk
-	var session uint64
-	var err error
-	var ok bool
-restore:
+// waiting tells whether restored chunks wait in the window for a missing one.
+func (decoder *Decoder) waiting() bool {
+	for _, held := range decoder.dispatcher.chunks {
+		if held != nil && held.csn >= decoder.dispatcher.awaiting {
+			return true
+		}
+	}
+	return false
+}
+
+// sendInOrder sends on the held chunks that are in order from awaiting.
+// False if ctx is done.
+func (decoder *Decoder) sendInOrder(ctx context.Context) bool {
 	for {
+		var at = decoder.dispatcher.awaiting % decoder.dispatcher.size
+		var next = decoder.dispatcher.chunks[at]
+		if next == nil || next.csn != decoder.dispatcher.awaiting {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case decoder.resultQueue <- decoded(next):
+			decoder.dispatcher.last = next.csn
+			decoder.dispatcher.awaiting++
+			decoder.dispatcher.chunks[at] = nil
+		}
+	}
+}
+
+// giveUpMissing skips the chunks missing before the oldest chunk waiting in
+// the window and sends on what then is in order. False if ctx is done.
+func (decoder *Decoder) giveUpMissing(ctx context.Context) bool {
+	var oldest *Chunk
+	for _, held := range decoder.dispatcher.chunks {
+		if held != nil && held.csn >= decoder.dispatcher.awaiting && (oldest == nil || held.csn < oldest.csn) {
+			oldest = held
+		}
+	}
+	if oldest == nil {
+		return true
+	}
+	decoder.lostChunks.Add(oldest.csn - decoder.dispatcher.awaiting)
+	decoder.dispatcher.awaiting = oldest.csn
+	return decoder.sendInOrder(ctx)
+}
+
+// giveUpBefore sends on the held chunks before csn bound in order, skips the
+// missing ones, and then what is in order from bound. False if ctx is done.
+func (decoder *Decoder) giveUpBefore(ctx context.Context, bound uint64) bool {
+	for decoder.dispatcher.awaiting < bound {
+		var at = decoder.dispatcher.awaiting % decoder.dispatcher.size
+		var held = decoder.dispatcher.chunks[at]
+		if held != nil && held.csn == decoder.dispatcher.awaiting {
+			select {
+			case <-ctx.Done():
+				return false
+			case decoder.resultQueue <- decoded(held):
+				decoder.dispatcher.chunks[at] = nil
+			}
+		} else {
+			decoder.lostChunks.Add(1)
+		}
+		decoder.dispatcher.awaiting++
+	}
+	decoder.dispatcher.last = max(decoder.dispatcher.last, bound-1)
+	decoder.dispatcher.first = max(decoder.dispatcher.first, decoder.dispatcher.last)
+	decoder.dropSkippedChunks()
+	return decoder.sendInOrder(ctx)
+}
+
+// takeChunk puts a restored chunk in order: sends it on if it is the awaited
+// one, else holds it in the window. False if ctx is done.
+func (decoder *Decoder) takeChunk(ctx context.Context, chunk *Chunk) bool {
+	if chunk.csn == 0 {
+		log.Println("dispatch: dropping invalid chunk: csn == 0")
+		atomic.AddUint64(decoder.dispatcher.err, 1)
+		return true
+	}
+	if chunk.session != decoder.dispatcher.session {
+		decoder.resetDispatcher(chunk.session, chunk.csn)
+	}
+	if chunk.csn <= decoder.dispatcher.last {
+		log.Printf("dispatch: detached chunk: csn: %d", chunk.csn)
+		atomic.AddUint64(decoder.dispatcher.err, 1)
+		return true
+	}
+	decoder.dispatcher.first = max(decoder.dispatcher.first, chunk.csn)
+	var at = chunk.csn % decoder.dispatcher.size
+	if chunk.csn != decoder.dispatcher.awaiting {
+		var held = decoder.dispatcher.chunks[at]
+		if held != nil && held.csn != chunk.csn {
+			// the window is full: give up what is missing before the
+			// chunk holding the slot
+			if !decoder.giveUpBefore(ctx, held.csn) {
+				return false
+			}
+			atomic.AddUint64(decoder.dispatcher.err, 1)
+		}
+		if chunk.csn != decoder.dispatcher.awaiting {
+			decoder.dispatcher.chunks[at] = chunk
+			atomic.AddUint64(decoder.dispatcher.ok, 1)
+			return true
+		}
+	}
+	decoder.dispatcher.chunks[at] = chunk
+	atomic.AddUint64(decoder.dispatcher.ok, 1)
+	return decoder.sendInOrder(ctx)
+}
+
+func (decoder *Decoder) dispatch(ctx context.Context) {
+	defer close(decoder.resultQueue)
+	var deadline = time.NewTimer(time.Hour)
+	deadline.Stop()
+	var deadlineC <-chan time.Time
+	for {
+		deadline.Stop()
+		deadlineC = nil
+		if decoder.ReorderDeadline > 0 {
+			decoder.dropSkippedChunks()
+			if !decoder.waiting() {
+				decoder.dispatcher.waitingSince = time.Time{}
+			} else {
+				if decoder.dispatcher.waitingSince.IsZero() {
+					decoder.dispatcher.waitingSince = time.Now()
+				}
+				deadline.Reset(time.Until(decoder.dispatcher.waitingSince.Add(decoder.ReorderDeadline)))
+				deadlineC = deadline.C
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case packets, ok = <-decoder.restoreQueue:
+		case <-deadlineC:
+			if !decoder.giveUpMissing(ctx) {
+				return
+			}
+			// the chunks still waiting now wait for the next gap
+			decoder.dispatcher.waitingSince = time.Time{}
+		case item, ok := <-decoder.dispatchQueue:
 			if !ok {
 				return
 			}
-			for i := range data {
-				data[i] = packets[i].Data()
-				if packets[i] != nil {
-					session = packets[i].session
+			switch {
+			case item.chunk != nil:
+				if !decoder.takeChunk(ctx, item.chunk) {
+					return
 				}
-			}
-
-			err = decoder.restorer.rs.ReconstructData(data)
-			if err != nil {
-				log.Printf("restore: rs.ReconstructData(data): err %v", err)
-				atomic.AddUint64(decoder.restorer.err, 1)
-				continue restore
-			}
-
-			chunk = new(Chunk)
-			ok = chunk.Unmarshal(data[:decoder.restorer.data])
-			if !ok {
-				log.Println("restore: dropping invalid packet: chunk.Unmarshal: not ok")
-				atomic.AddUint64(decoder.restorer.err, 1)
-				continue restore
-			}
-			chunk.session = session
-			decoder.trace.Load().Chunk(latencytrace.ClientRestored, chunk.session, chunk.csn, time.Time{})
-
-			select {
-			case <-ctx.Done():
-				return
-			case decoder.dispatchQueue <- chunk:
-				atomic.AddUint64(decoder.restorer.ok, 1)
-				continue restore
+			case item.lostBefore != 0:
+				if item.session != decoder.dispatcher.session {
+					decoder.resetDispatcher(item.session, item.lostBefore)
+				}
+				if !decoder.giveUpBefore(ctx, item.lostBefore) {
+					return
+				}
+				decoder.dispatcher.waitingSince = time.Time{}
 			}
 		}
 	}
@@ -317,155 +357,253 @@ func (decoder *Decoder) startSession(session uint64) {
 	log.Printf("assembly: new session %x", session)
 	decoder.assembler.previousSession = decoder.assembler.session
 	decoder.assembler.session = session
-	decoder.assembler.maxCsn = 0
-	for i := range decoder.assembler.lines {
-		decoder.assembler.lines[i].reuse(0)
+	decoder.assembler.current.reset(0)
+	decoder.assembler.previous.reset(0)
+}
+
+// code returns the Reed-Solomon code of k data and m parity shards, made
+// once per pair.
+func (decoder *Decoder) code(k, m int) (reedsolomon.Encoder, error) {
+	if rs, ok := decoder.assembler.codes[[2]int{k, m}]; ok {
+		return rs, nil
+	}
+	rs, err := reedsolomon.New(k, m)
+	if err != nil {
+		return nil, err
+	}
+	decoder.assembler.codes[[2]int{k, m}] = rs
+	return rs, nil
+}
+
+// send hands an item to the dispatcher; false if ctx is done.
+func (decoder *Decoder) send(ctx context.Context, item dispatchItem) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case decoder.dispatchQueue <- item:
+		return true
 	}
 }
 
+// takePiece files a data shard's piece under its chunk and sends the chunk
+// on once it has all its pieces. False if ctx is done.
+func (decoder *Decoder) takePiece(ctx context.Context, block *openBlock, shard []byte) bool {
+	d, ok := readShardDescriptor(shard)
+	if !ok {
+		atomic.AddUint64(decoder.assembler.err, 1)
+		return true
+	}
+	if block.delivered[d.csn] {
+		return true
+	}
+	var pieces = block.pieces[d.csn]
+	if pieces == nil {
+		pieces = make([][]byte, d.pieces)
+		block.pieces[d.csn] = pieces
+	}
+	if len(pieces) != int(d.pieces) {
+		atomic.AddUint64(decoder.assembler.err, 1)
+		return true
+	}
+	pieces[d.piece] = d.pieceOf(shard)
+	for _, piece := range pieces {
+		if piece == nil {
+			return true
+		}
+	}
+	block.delivered[d.csn] = true
+	var chunk = new(Chunk)
+	if !chunk.Unmarshal(bytes.Join(pieces, nil)) || chunk.csn != d.csn {
+		log.Printf("assembly: chunk %d: its pieces do not make a chunk", d.csn)
+		atomic.AddUint64(decoder.assembler.err, 1)
+		return true
+	}
+	chunk.session = decoder.assembler.session
+	decoder.trace.Load().Chunk(latencytrace.ClientRestored, chunk.session, chunk.csn, time.Time{})
+	return decoder.send(ctx, dispatchItem{chunk: chunk})
+}
+
+// restoreBlock restores the missing data shards of the block from parity and
+// sends on the chunks they complete. False if ctx is done.
+func (decoder *Decoder) restoreBlock(ctx context.Context, block *openBlock) bool {
+	block.restored = true
+	rs, err := decoder.code(block.k, block.m)
+	if err != nil {
+		log.Printf("restore: block %d: reedsolomon.New(%d, %d): %v", block.id, block.k, block.m, err)
+		return true
+	}
+	var shards = make([][]byte, block.k+block.m)
+	var missing []int
+	for i := range shards {
+		switch {
+		case block.shards[i] == nil:
+			if i < block.k {
+				missing = append(missing, i)
+			}
+		case i < block.k:
+			// the code counts every data shard ShardSize long
+			shards[i] = make([]byte, ShardSize)
+			copy(shards[i], block.shards[i])
+		default:
+			shards[i] = block.shards[i]
+		}
+	}
+	if len(missing) == 0 {
+		return true
+	}
+	if err = rs.ReconstructData(shards); err != nil {
+		log.Printf("restore: block %d: rs.ReconstructData: %v", block.id, err)
+		atomic.AddUint64(decoder.assembler.err, 1)
+		return true
+	}
+	for _, i := range missing {
+		if !decoder.takePiece(ctx, block, shards[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// blockReorderTolerance is how many packets of the next block may come
+// before the last late packet of a block. The encoder sends all of a block
+// before the next one, so on a link that keeps the order a packet of the next
+// block means nothing more of this one comes; a few packets of slack keep a
+// slight reordering from costing a whole block.
+const blockReorderTolerance = 4
+
+// giveUpBlock gives the block up: its chunks that have not gone on are lost,
+// all of the chunks before csn next. False if ctx is done.
+func (decoder *Decoder) giveUpBlock(ctx context.Context, block *openBlock, next uint64) bool {
+	if block.givenUp {
+		return true
+	}
+	block.givenUp = true
+	for csn := range block.pieces {
+		if !block.delivered[csn] {
+			decoder.incompleteChunks.Add(1)
+		}
+	}
+	return decoder.send(ctx, dispatchItem{session: decoder.assembler.session, lostBefore: next})
+}
+
+// takePacket files a packet in its block: the current one, the one before it
+// (a late packet), or a new one, which makes the current one previous and
+// gives the previous one up. False if ctx is done.
+func (decoder *Decoder) takePacket(ctx context.Context, packet *Packet) bool {
+	if packet.session != decoder.assembler.session {
+		if decoder.assembler.session != 0 && packet.session == decoder.assembler.previousSession {
+			// late packet of the sender run before the restart
+			return true
+		}
+		decoder.startSession(packet.session)
+	}
+	var current, previous = &decoder.assembler.current, &decoder.assembler.previous
+	var block *openBlock
+	switch {
+	case packet.block == current.id:
+		block = current
+	case packet.block > current.id:
+		if !decoder.giveUpBlock(ctx, previous, current.id) {
+			return false
+		}
+		decoder.assembler.current, decoder.assembler.previous = decoder.assembler.previous, decoder.assembler.current
+		current.reset(packet.block)
+		block = current
+	case packet.block == previous.id && !previous.givenUp:
+		block = previous
+	default:
+		// late packet of a block given up already
+		atomic.AddUint64(decoder.assembler.err, 1)
+		return true
+	}
+	if !decoder.addPacket(ctx, block, packet) {
+		return false
+	}
+	if block == current && current.found >= blockReorderTolerance {
+		return decoder.giveUpBlock(ctx, previous, current.id)
+	}
+	return true
+}
+
+// addPacket files a packet in block. False if ctx is done.
+func (decoder *Decoder) addPacket(ctx context.Context, block *openBlock, packet *Packet) bool {
+	if block.restored || block.shards[packet.index] != nil {
+		// surplus parity of a restored block, or a duplicate datagram
+		return true
+	}
+	if packet.kind == PacketKindParity {
+		if block.k != 0 && (block.k != int(packet.k) || block.m != int(packet.m)) {
+			log.Printf("assembly: block %d: parity says %d+%d, earlier %d+%d", block.id, packet.k, packet.m, block.k, block.m)
+			atomic.AddUint64(decoder.assembler.err, 1)
+			return true
+		}
+		block.k, block.m = int(packet.k), int(packet.m)
+	} else if block.k != 0 && int(packet.index) >= block.k {
+		atomic.AddUint64(decoder.assembler.err, 1)
+		return true
+	}
+	block.shards[packet.index] = packet.shard
+	block.found++
+	atomic.AddUint64(decoder.assembler.ok, 1)
+	if packet.kind == PacketKindData && !decoder.takePiece(ctx, block, packet.shard) {
+		return false
+	}
+	if block.k != 0 && block.found >= block.k {
+		return decoder.restoreBlock(ctx, block)
+	}
+	return true
+}
+
 func (decoder *Decoder) assembly(ctx context.Context) {
-	defer close(decoder.restoreQueue)
-	var lines = uint64(len(decoder.assembler.lines))
-	var packet *PacketV2
-	var ok bool
-assembly:
+	defer close(decoder.dispatchQueue)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case packet, ok = <-decoder.assemblyQueue:
+		case packet, ok := <-decoder.assemblyQueue:
 			if !ok {
 				return
 			}
-			if packet == nil {
-				log.Println("assembly: dropping invalid packet: packet is nil")
-				atomic.AddUint64(decoder.assembler.err, 1)
-				continue assembly
+			if !decoder.takePacket(ctx, packet) {
+				return
 			}
-			if uint64(packet.psn) >= decoder.restorer.total {
-				log.Printf("assembly: invalid psn: %d", packet.psn)
-				atomic.AddUint64(decoder.assembler.err, 1)
-				continue assembly
-			}
-			if packet.csn == 0 {
-				log.Println("assembly: dropping invalid packet: csn == 0")
-				atomic.AddUint64(decoder.assembler.err, 1)
-				continue assembly
-			}
-
-			if packet.session != decoder.assembler.session {
-				if decoder.assembler.session != 0 && packet.session == decoder.assembler.previousSession {
-					// late packet of the sender run before the restart
-					continue assembly
-				}
-				decoder.startSession(packet.session)
-			}
-
-			if packet.csn+lines <= decoder.assembler.maxCsn {
-				// its line has been reused by a newer chunk already
-				atomic.AddUint64(decoder.assembler.err, 1)
-				continue assembly
-			}
-			decoder.assembler.maxCsn = max(decoder.assembler.maxCsn, packet.csn)
-
-			var line = &decoder.assembler.lines[packet.csn%lines]
-			switch {
-			case line.csn == packet.csn:
-			case line.csn < packet.csn:
-				if line.found != 0 && !line.restored {
-					decoder.incompleteChunks.Add(1)
-					atomic.AddUint64(decoder.assembler.err, 1)
-				}
-				line.reuse(packet.csn)
-			default:
-				// an older chunk than the one holding the line
-				atomic.AddUint64(decoder.assembler.err, 1)
-				continue assembly
-			}
-
-			if line.restored {
-				// surplus parity of a chunk that is already restored
-				continue assembly
-			}
-			if line.packets[packet.psn] != nil {
-				// duplicate datagram
-				continue assembly
-			}
-			line.packets[packet.psn] = packet
-			line.found++
-
-			if line.found == decoder.restorer.data {
-				select {
-				case <-ctx.Done():
-					return
-				case decoder.restoreQueue <- slices.Clone(line.packets):
-					line.restored = true
-					clear(line.packets)
-				}
-			}
-			atomic.AddUint64(decoder.assembler.ok, 1)
 		}
 	}
 }
 
 func (decoder *Decoder) decode(ctx context.Context) {
 	defer close(decoder.assemblyQueue)
-	var data []byte
-	var packet *PacketV2
-	var ok bool
-decode:
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case data = <-decoder.argumentQueue:
-			if len(data) != PacketV2Size {
-				log.Printf("decode: invalid data: %d bytes", len(data))
-				continue decode
+		case data := <-decoder.argumentQueue:
+			var packet = new(Packet)
+			if !packet.Unmarshal(data) {
+				log.Printf("decode: dropping invalid packet: %d bytes", len(data))
+				continue
 			}
-
-			packet = new(PacketV2)
-			ok = packet.Unmarshal(data)
-			if !ok {
-				log.Println("decode: packet.Unmarshal is not ok")
-				continue decode
-			}
-
-			if packet.kind != KindData {
-				log.Printf("decode: packet: invalid kind: %d", packet.kind)
-				continue decode
-			}
-
+			// the caller may reuse data
+			packet.shard = bytes.Clone(packet.shard)
 			select {
 			case <-ctx.Done():
 				return
 			case decoder.assemblyQueue <- packet:
-				continue decode
 			}
 		}
 	}
-}
-
-func (decoder *Decoder) IncomingSize() uint64 {
-	return PacketV2Size
-}
-
-func (decoder *Decoder) OutgoingSize() uint64 {
-	return PacketV2DataSize*decoder.restorer.data - ChunkHeaderSize
 }
 
 // Decode starts the decoder. The in channel is never closed by the decoder,
 // so writers may keep sending until ctx is done; out is closed once the
 // decoder has stopped after ctx is done.
 func (decoder *Decoder) Decode(ctx context.Context) (in chan<- []byte, out <-chan DecodedChunk, err error) {
-	decoder.resultQueue = make(chan DecodedChunk, 16*decoder.restorer.data)
-	decoder.dispatchQueue = make(chan *Chunk, 16)
-	decoder.restoreQueue = make(chan []*PacketV2, 16*decoder.restorer.data)
-	decoder.assemblyQueue = make(chan *PacketV2, 16*decoder.restorer.data)
-	decoder.argumentQueue = make(chan []byte, 16*decoder.restorer.data)
+	decoder.resultQueue = make(chan DecodedChunk, 64)
+	decoder.dispatchQueue = make(chan dispatchItem, 64)
+	decoder.assemblyQueue = make(chan *Packet, maxBlockShards)
+	decoder.argumentQueue = make(chan []byte, maxBlockShards)
 
 	go decoder.dispatch(ctx)
-	go decoder.restore(ctx)
 	go decoder.assembly(ctx)
 	go decoder.decode(ctx)
 	return decoder.argumentQueue, decoder.resultQueue, nil

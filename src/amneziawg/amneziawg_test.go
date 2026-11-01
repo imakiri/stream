@@ -231,7 +231,7 @@ PersistentKeepalive = 25
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(cfg.Addresses) != "[10.8.1.2 fd00::2]" || fmt.Sprint(cfg.DNSServers) != "[1.1.1.1 1.0.0.1]" || cfg.MTU != defaultMTU {
+	if fmt.Sprint(cfg.Addresses) != "[10.8.1.2 fd00::2]" || fmt.Sprint(cfg.DNSServers) != "[1.1.1.1 1.0.0.1]" || cfg.MTU != DefaultMTU {
 		t.Errorf("addresses %v, dns %v, mtu %d", cfg.Addresses, cfg.DNSServers, cfg.MTU)
 	}
 	var privateHex = hexOf(t, keys.private)

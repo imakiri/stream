@@ -17,7 +17,7 @@ func newTestPacer(bitsPerSecond uint64, clock *fakeClock) *pacer {
 	return p
 }
 
-// TestPacerSpreadsABurst hands the pacer an interleave group at once: it
+// TestPacerSpreadsABurst hands the pacer a burst of packets at once: it
 // must take the time the rate gives, with at most a millisecond of packets
 // going back to back.
 func TestPacerSpreadsABurst(t *testing.T) {

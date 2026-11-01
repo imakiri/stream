@@ -13,8 +13,6 @@ import (
 )
 
 func TestCodec(t *testing.T) {
-	const dataParts = 4
-	const totalParts = 8
 	var err error
 	var ctx, cancel = signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
 	defer cancel()
@@ -25,10 +23,10 @@ func TestCodec(t *testing.T) {
 	var encoder *Encoder
 	var decoder *Decoder
 
-	encoder, err = NewEncoder(20*time.Millisecond, 32, dataParts, totalParts)
+	encoder, err = NewEncoder(20*time.Millisecond, 6, 4, 33)
 	require.NoError(t, err)
 
-	decoder, err = NewDecoder(dataParts, totalParts, 128, 16)
+	decoder, err = NewDecoder(16)
 	require.NoError(t, err)
 
 	encoderIn, encoderOut, err := encoder.Encode(ctx)
@@ -77,7 +75,7 @@ func TestCodec(t *testing.T) {
 
 	go func() {
 		var data []byte
-		var packet *PacketV2
+		var packet *Packet
 		var ok bool
 		for {
 			select {
@@ -85,7 +83,7 @@ func TestCodec(t *testing.T) {
 				return
 			case data = <-encoderOut:
 				// no packet loss for now
-				packet = new(PacketV2)
+				packet = new(Packet)
 				ok = packet.Unmarshal(data)
 				require.True(t, ok)
 				//t.Log(packet)

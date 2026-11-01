@@ -74,7 +74,7 @@ func (r testRoot) issue(t *testing.T) wire.Credentials {
 	}
 }
 
-var testFec = FecConfig{DataParts: 4, TotalParts: 6}
+var testFec = FecConfig{ChunkPackets: 2, BlockChunks: 2, ParityPercent: 50}
 
 // startTestServer starts a server and returns the port of its stream input
 // and the server.
@@ -86,7 +86,7 @@ func startTestServer(t *testing.T, ctx context.Context, relayCfg RelayConfig, ro
 		StreamInputPort: inputPort,
 		PacingRate:      DefaultPacingRate,
 		Fec:             testFec,
-		Encoder:         EncoderConfig{DispatcherTimeout: 5 * time.Millisecond, DispatcherSize: 2},
+		Encoder:         EncoderConfig{ChunkMaxAge: 5 * time.Millisecond},
 		Credentials:     creds,
 		Verifier:        wire.RootVerifier{Root: root.pub},
 	})
@@ -112,8 +112,7 @@ func startTestPlayer(t *testing.T, ctx context.Context, relayCfg RelayConfig, ro
 	client, err := NewClient(ClientConfig{
 		Relay:       relayCfg,
 		PlayerPort:  uint16(player.LocalAddr().(*net.UDPAddr).Port),
-		Fec:         testFec,
-		Decoder:     DecoderConfig{AssemblerSize: 16, DispatcherSize: 8},
+		Decoder:     DecoderConfig{DispatcherSize: 8},
 		Credentials: creds,
 		Verifier:    wire.RootVerifier{Root: root},
 		ServerID:    serverID,

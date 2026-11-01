@@ -43,10 +43,8 @@ type Profile struct {
 
 	PlayerPort int // local UDP port the player reads the stream from
 
-	FecDataParts          int
-	FecTotalParts         int
-	DecoderAssemblerSize  int
-	DecoderDispatcherSize int
+	DecoderDispatcherSize  int
+	DecoderReorderDeadline int // milliseconds; 0: none
 
 	NTPServer string // empty: no NTP
 }
@@ -105,15 +103,13 @@ func (p *Profile) Save(dir string) error {
 
 func profileOf(f src.ClientConfigFile) *Profile {
 	var p = &Profile{
-		RelayAddr:             f.Relay.Addr,
-		RelayPort:             int(f.Relay.Port),
-		RelayNetwork:          f.Relay.Network,
-		PlayerPort:            int(f.Player.Port),
-		FecDataParts:          int(f.Fec.DataParts),
-		FecTotalParts:         int(f.Fec.TotalParts),
-		DecoderAssemblerSize:  int(f.Decoder.AssemblerSize),
-		DecoderDispatcherSize: int(f.Decoder.DispatcherSize),
-		NTPServer:             f.Clock.NTPServer,
+		RelayAddr:              f.Relay.Addr,
+		RelayPort:              int(f.Relay.Port),
+		RelayNetwork:           f.Relay.Network,
+		PlayerPort:             int(f.Player.Port),
+		DecoderDispatcherSize:  int(f.Decoder.DispatcherSize),
+		DecoderReorderDeadline: int(f.Decoder.ReorderDeadlineMilli()),
+		NTPServer:              f.Clock.NTPServer,
 	}
 	if p.RelayNetwork == "" {
 		p.RelayNetwork = "udp"
@@ -130,11 +126,11 @@ func profileOf(f src.ClientConfigFile) *Profile {
 }
 
 func (p *Profile) configFile() src.ClientConfigFile {
+	var reorderDeadline = uint64(p.DecoderReorderDeadline)
 	var f = src.ClientConfigFile{
 		Relay:   src.RelayConfigFile{Addr: strings.TrimSpace(p.RelayAddr), Port: uint16(p.RelayPort), Network: p.RelayNetwork},
 		Player:  src.PlayerConfigFile{Port: uint16(p.PlayerPort)},
-		Fec:     src.FecConfigFile{DataParts: uint64(p.FecDataParts), TotalParts: uint64(p.FecTotalParts)},
-		Decoder: src.DecoderConfigFile{AssemblerSize: uint64(p.DecoderAssemblerSize), DispatcherSize: uint64(p.DecoderDispatcherSize)},
+		Decoder: src.DecoderConfigFile{DispatcherSize: uint64(p.DecoderDispatcherSize), ReorderDeadline: &reorderDeadline},
 		Clock:   src.ClockConfigFile{NTPServer: strings.TrimSpace(p.NTPServer)},
 	}
 	switch p.ProxyKind {

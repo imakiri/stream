@@ -93,6 +93,11 @@ func readTrace(path string, chunks map[chunkKey]*chunkEvents) error {
 			events.chunk[stage] = at
 			continue
 		}
+		if psn >= latencytrace.ParityPsnBase {
+			// a parity packet of the block that starts with this chunk:
+			// not one of the chunk's own packets
+			continue
+		}
 		if events.packets[stage] == nil {
 			events.packets[stage] = map[int64]int64{}
 		}
@@ -180,13 +185,13 @@ func main() {
 
 	var points = []point{
 		{"server: first byte from OBS", "the chunk's time 0", chunkStage(latencytrace.ServerInput)},
-		{"server: chunk closed", "filling the chunk (8 KB) or 10 ms without input", chunkStage(latencytrace.ServerChunk)},
-		{"server: FEC done", "Reed-Solomon parity", chunkStage(latencytrace.ServerFEC)},
-		{"server: first packet out of the interleaver", "waits for the 4 chunks it mixes", func(e *chunkEvents) (int64, bool) { return e.first(latencytrace.ServerDispatch) }},
+		{"server: chunk closed", "filling the chunk (chunk_packets packets) or chunk_max_age without input", chunkStage(latencytrace.ServerChunk)},
+		{"server: chunk cut into packets", "data shards; the block's parity follows later", chunkStage(latencytrace.ServerShards)},
+		{"server: first packet out of the encoder", "the chunk's data packets go out as it closes", func(e *chunkEvents) (int64, bool) { return e.first(latencytrace.ServerEncoderOut) }},
 		{"server: first packet sent", "pacing", func(e *chunkEvents) (int64, bool) { return e.first(latencytrace.ServerSent) }},
-		{"server: last packet sent", "the chunk's packets spread over the interleave group", func(e *chunkEvents) (int64, bool) { return e.last(latencytrace.ServerSent) }},
+		{"server: last packet sent", "the chunk's data packets back to back at the pacing rate", func(e *chunkEvents) (int64, bool) { return e.last(latencytrace.ServerSent) }},
 		{"phone: first packet received", "network: PC → relay → phone", func(e *chunkEvents) (int64, bool) { return e.first(latencytrace.ClientReceived) }},
-		{"phone: chunk restored", "enough packets in for FEC", chunkStage(latencytrace.ClientRestored)},
+		{"phone: chunk restored", "all its data packets in, or its block restored from parity", chunkStage(latencytrace.ClientRestored)},
 		{"phone: chunk to the player", "the decoder puts chunks back in order", chunkStage(latencytrace.ClientOut)},
 	}
 

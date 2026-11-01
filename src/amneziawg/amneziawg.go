@@ -24,9 +24,9 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
 )
 
-// defaultMTU is the MTU of wg-quick and of the Amnezia app when the config
+// DefaultMTU is the MTU of wg-quick and of the Amnezia app when the config
 // sets none.
-const defaultMTU = 1420
+const DefaultMTU = 1420
 
 // Config is a parsed AmneziaWG config file.
 type Config struct {
@@ -79,7 +79,7 @@ var wgQuickOnlyKeys = map[string]bool{
 // amneziawg-go as they are, so keys of newer AmneziaWG versions work if the
 // library knows them. A plain WireGuard config works too.
 func ParseConfig(r io.Reader) (Config, error) {
-	var cfg = Config{MTU: defaultMTU}
+	var cfg = Config{MTU: DefaultMTU}
 	var device strings.Builder
 	var section string
 	var peer *peerConfig

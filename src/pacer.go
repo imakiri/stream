@@ -13,10 +13,10 @@ const DefaultPacingRate = 30_000_000 // bits per second
 const pacerBurst = time.Millisecond
 
 // pacer spreads packets over time at a fixed rate. The encoder hands over
-// the packets of a whole interleave group at once (40 packets with the
-// default settings); sent back to back they leave at the speed of the
-// network card and a shaper on the way cuts off the tail of the burst,
-// more packets of a chunk than FEC can restore. The relay forwards each
+// the data packets of a chunk at once, and of a key frame's several chunks
+// (60 packets and more), and a block's parity; sent back to back they leave
+// at the speed of the network card and a shaper on the way cuts off the
+// tail of the burst, more packets of a block than FEC can restore. The relay forwards each
 // packet as it comes, so pacing at the server smooths both legs.
 type pacer struct {
 	bitsPerSecond uint64

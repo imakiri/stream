@@ -17,21 +17,26 @@ import (
 	"github.com/imakiri/stream/src/wire"
 )
 
-// FecConfig is the Reed-Solomon split of a chunk; server and clients must
-// use the same.
+// FecConfig is the server's FEC: chunks of at most ChunkPackets data
+// packets, Reed-Solomon parity of ParityPercent over blocks of BlockChunks
+// chunks. Clients read the layout from the packets; see codec/packet.go.
 type FecConfig struct {
-	DataParts  uint64
-	TotalParts uint64
+	ChunkPackets  uint64
+	BlockChunks   uint64
+	ParityPercent uint64
 }
 
 type EncoderConfig struct {
-	DispatcherTimeout time.Duration
-	DispatcherSize    uint64
+	// ChunkMaxAge is how long a chunk may wait for more input after its
+	// first byte before it is sent partly filled.
+	ChunkMaxAge time.Duration
 }
 
 type DecoderConfig struct {
-	AssemblerSize  uint64
 	DispatcherSize uint64
+	// ReorderDeadline, when not zero, is how long restored chunks wait for
+	// a missing one before it; see codec.Decoder.ReorderDeadline.
+	ReorderDeadline time.Duration
 }
 
 // ServerConfig configures the stream server: the source that takes the
@@ -69,7 +74,7 @@ type Server struct {
 }
 
 func NewServer(cfg ServerConfig) (*Server, error) {
-	encoder, err := codec.NewEncoder(cfg.Encoder.DispatcherTimeout, cfg.Encoder.DispatcherSize, cfg.Fec.DataParts, cfg.Fec.TotalParts)
+	encoder, err := codec.NewEncoder(cfg.Encoder.ChunkMaxAge, cfg.Fec.ChunkPackets, cfg.Fec.BlockChunks, cfg.Fec.ParityPercent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create encoder: %w", err)
 	}

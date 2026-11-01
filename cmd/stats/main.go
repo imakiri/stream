@@ -36,9 +36,9 @@ import (
 	"github.com/imakiri/stream/src/wire"
 )
 
-// statsPacketSize is the size of a stream data packet: an FEC packet sealed
+// statsPacketSize is the size of the largest stream data packet: an FEC packet sealed
 // in a wire data packet.
-const statsPacketSize = codec.PacketV2Size + wire.DataOverhead
+const statsPacketSize = codec.PacketMaxSize + wire.DataOverhead
 
 // A stats packet has the wire data header, so the relay routes it as stream
 // data, then the send time; the rest is random, like ciphertext.

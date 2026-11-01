@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestServerPacingRate reads the pacing rate from the example config, from
@@ -105,5 +106,31 @@ func TestClientConfigFileRoundTrip(t *testing.T) {
 	text, _ := withProxy.Marshal()
 	if strings.Contains(string(text), "socks5") || strings.Contains(string(text), "[proxy.http]") {
 		t.Errorf("unset proxies are written:\n%s", text)
+	}
+}
+
+// TestClientReorderDeadline reads [decoder] reorder_deadline: the default
+// when an older client.cfg does not have it, and 0 (off) only when set so.
+func TestClientReorderDeadline(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		config string
+		want   time.Duration
+	}{
+		{"not set", "[decoder]\n  dispatcher_size = 12\n", DefaultReorderDeadline},
+		{"set", "[decoder]\n  reorder_deadline = 20\n", 20 * time.Millisecond},
+		{"off", "[decoder]\n  reorder_deadline = 0\n", 0},
+	} {
+		var path = filepath.Join(t.TempDir(), "client.cfg")
+		if err := os.WriteFile(path, []byte(c.config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadClientConfig(path)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if cfg.Decoder.ReorderDeadline != c.want {
+			t.Errorf("%s: reorder deadline %v, want %v", c.name, cfg.Decoder.ReorderDeadline, c.want)
+		}
 	}
 }

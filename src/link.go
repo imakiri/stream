@@ -24,11 +24,11 @@ import (
 const packetBufferSize = 1<<16 - 1
 
 // socketBufferSize is the kernel buffer of the UDP sockets to the relay and
-// to the player. The encoder sends the packets of an interleave group, 40 at
-// the default settings, back to back, and the receive buffer must take such
-// a burst whole: with 20 packets it dropped a few of every group even on
-// loopback, and every chunk lost that way held the decoder for its reorder
-// window, about 100 ms. 1 MiB holds about ten groups; Linux caps it at
+// to the player. The encoder sends the packets of a key frame, 60 and more,
+// back to back, and the receive buffer must take such a burst whole: with 20
+// packets it dropped a few of every 40-packet burst even on loopback, and
+// every chunk lost that way held the decoder for its reorder window, about
+// 100 ms. 1 MiB holds about ten groups; Linux caps it at
 // net.core.rmem_max. The buffer adds no delay while the reader keeps up.
 const socketBufferSize = 1 << 20
 

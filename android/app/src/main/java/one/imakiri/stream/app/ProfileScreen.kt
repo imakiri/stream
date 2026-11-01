@@ -41,10 +41,8 @@ private class ProfileForm(profile: Profile) {
     var proxyURL by mutableStateOf(profile.proxyURL)
     var amneziaWGConfig by mutableStateOf(profile.amneziaWGConfig)
     var playerPort by mutableStateOf(profile.playerPort.toString())
-    var fecDataParts by mutableStateOf(profile.fecDataParts.toString())
-    var fecTotalParts by mutableStateOf(profile.fecTotalParts.toString())
-    var decoderAssemblerSize by mutableStateOf(profile.decoderAssemblerSize.toString())
     var decoderDispatcherSize by mutableStateOf(profile.decoderDispatcherSize.toString())
+    var decoderReorderDeadline by mutableStateOf(profile.decoderReorderDeadline.toString())
     var ntpServer by mutableStateOf(profile.ntpServer)
 
     /** The profile of the fields; throws on a number that is not one. */
@@ -56,10 +54,8 @@ private class ProfileForm(profile: Profile) {
         it.proxyURL = proxyURL
         it.amneziaWGConfig = amneziaWGConfig
         it.playerPort = number("player port", playerPort)
-        it.fecDataParts = number("fec data parts", fecDataParts)
-        it.fecTotalParts = number("fec total parts", fecTotalParts)
-        it.decoderAssemblerSize = number("decoder assembler size", decoderAssemblerSize)
         it.decoderDispatcherSize = number("decoder dispatcher size", decoderDispatcherSize)
+        it.decoderReorderDeadline = number("decoder reorder deadline", decoderReorderDeadline)
         it.ntpServer = ntpServer
     }
 
@@ -68,8 +64,8 @@ private class ProfileForm(profile: Profile) {
 }
 
 /**
- * The profile form: imported from a client.cfg or typed in; the player, FEC
- * and decoder fields start with the defaults. An import overwrites every field.
+ * The profile form: imported from a client.cfg or typed in; the player and
+ * decoder fields start with the defaults (the FEC layout comes in the packets). An import overwrites every field.
  */
 @Composable
 fun ProfileScreen(editing: Boolean, onSaved: () -> Unit) {
@@ -143,16 +139,10 @@ fun ProfileScreen(editing: Boolean, onSaved: () -> Unit) {
         Section("Player")
         Field("Local UDP port", form.playerPort, number = true) { form.playerPort = it }
 
-        Section("FEC (must match the server)")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Field("Data parts", form.fecDataParts, Modifier.weight(1f), number = true) { form.fecDataParts = it }
-            Field("Total parts", form.fecTotalParts, Modifier.weight(1f), number = true) { form.fecTotalParts = it }
-        }
-
         Section("Decoder")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Field("Assembler size", form.decoderAssemblerSize, Modifier.weight(1f), number = true) { form.decoderAssemblerSize = it }
             Field("Dispatcher size", form.decoderDispatcherSize, Modifier.weight(1f), number = true) { form.decoderDispatcherSize = it }
+            Field("Reorder deadline, ms", form.decoderReorderDeadline, Modifier.weight(1f), number = true) { form.decoderReorderDeadline = it }
         }
 
         Section("Clock")

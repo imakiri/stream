@@ -68,8 +68,12 @@ link can go through a proxy, set in the `[proxy]` section of the config
 (`src/proxy.go`), one at most:
 
 - `[proxy.socks5] url = "socks5://127.0.0.1:2080"`: a SOCKS5 proxy such as a
-  local sing-box, TCP only. Over TCP a lost packet is resent rather than
-  skipped, so losses turn into stalls and delay instead of FEC repairs.
+  local sing-box (`socks5://user:pass@host:port` for RFC 1929 credentials).
+  Over TCP with CONNECT; over UDP with UDP ASSOCIATE (`src/socks5udp.go`),
+  which the proxy must support (sing-box, Dante, 3proxy do; many SSH and
+  browser proxies do not). Prefer UDP: over TCP a lost packet is resent
+  rather than skipped, so losses turn into stalls and delay instead of FEC
+  repairs.
 - `[proxy.http] url = "http://127.0.0.1:8080"`: an HTTP CONNECT proxy, TCP
   only. Credentials in the URL become a `Proxy-Authorization` header.
 - `[proxy.amneziawg] config = "amneziawg.conf"`: an AmneziaWG tunnel
@@ -81,7 +85,12 @@ link can go through a proxy, set in the `[proxy]` section of the config
   `[Peer]` with `PublicKey`, `Endpoint`, `AllowedIPs`); the path is relative
   to the config file. A plain WireGuard config works too. The relay address
   is resolved by the tunnel's `DNS` if the config has one, else by the
-  system.
+  system. The relay is reached at whatever address `AllowedIPs` sends into
+  the tunnel: with the relay's public IP there next to the tunnel address
+  (`AllowedIPs = 10.77.7.1/32, 89.44.198.165/32`) the config keeps the
+  same `addr = "imakiri.one"` with and without the tunnel. `AllowedIPs`
+  takes IPs only, so it must follow the host if the IP changes (TODO in
+  `src/proxy.go`: add the resolved relay IPs automatically).
 
 Packets are marked DSCP EF (46), which home routers and Wi-Fi put into the
 voice/video queue.
@@ -112,32 +121,59 @@ root public key, server ID).
 
 ### FEC codec
 
-`src/codec`: the encoder collects input into chunks of
-`data_parts × 1024 − 22` bytes (8170 B with 8 data parts), flushing a partial
-chunk after `dispatcher_timeout` ms without input. Each chunk becomes
-`total_parts` packets of 1024 bytes of Reed-Solomon shards; any `data_parts`
-of them restore the chunk. The packets of `dispatcher_size` chunks are
-interleaved, so a burst loss spreads over several chunks. Each packet carries
-the chunk and packet numbers, a random session per encoder run and an 8-byte
-SHA-1 prefix.
+`src/codec` (packet layout in `src/codec/packet.go`): the encoder collects
+input into chunks of up to `chunk_packets` packets of 1318 bytes (7886 B with
+the default 6, less the 22-byte chunk header), flushing a partial chunk
+`chunk_max_age` ms after its first byte came in. A chunk is cut into pieces,
+one per data packet; the last piece goes out as short as it is. The data
+packets of a chunk go out as soon as it is closed.
 
-The encoder hands over the packets of an interleave group at once (40 with
-the defaults). Sent back to back they leave at the speed of the network card,
-and a shaper on the way (home router, provider) cuts off the tail of the
-burst: 15-25 packets in a row, more than FEC restores. So the server paces the
-data packets (`src/pacer.go`, `[pacing] rate_mbit` in `server.cfg`, 30 Mbit/s
-by default, about three times the wire rate). The relay forwards each packet
-as it comes, so this smooths the way to the clients too. The price is the
-time a big frame takes at that rate: ~25 ms for a 75 KB keyframe with its
-parity, ~5 ms for an ordinary frame.
+Reed-Solomon parity is made over a block of `block_chunks` chunks (4): when
+the block closes (full, or `block_chunks × chunk_max_age` after its first
+chunk), `parity_percent` (33) parity packets per 100 data packets go out
+after its data packets. Any that many lost packets of a block, anywhere in
+it, are restored. For the code every data shard counts as full length, the
+rest zeros, so the short pieces cost nothing on the wire. A data shard starts
+with a descriptor (chunk number, piece, pieces, length), so a restored shard
+tells which chunk it belongs to. Each packet carries a random session per
+encoder run, the block's number, the shard's index and an 8-byte SHA-1
+prefix; the largest is 1362 bytes, which with the stream seal fits the UDP
+payload of an AmneziaWG tunnel of MTU 1420. Clients read the layout from the
+packets, so only the server has a `[fec]` section.
 
-The decoder collects packets per chunk in a ring of `assembler_size` lines,
-restores a chunk as soon as `data_parts` packets are there and puts chunks
-back in order in a window of `dispatcher_size` chunks; a chunk that does not
-come in time is skipped.
+A chunk whose data packets all came goes to the player at once; one with
+losses waits for its block's parity. A block's packets all go before the
+next block's, so the decoder gives up the chunks of a block it could not
+restore once 4 packets of the next block have come (slack for a slight
+reordering), and puts chunks back in
+order in a window of `dispatcher_size` chunks. When nothing comes after a
+loss, a missing chunk is skipped after the chunks after it have waited
+`reorder_deadline` ms (30 when not set; 0: only when `dispatcher_size` newer
+chunks have come).
 
-With 8 of 10 parts the stream on the wire is about 1.3 times the video
-bitrate: 8 Mbit/s of video take about 10.5 Mbit/s.
+Why blocks (measured 2026-11-01 on a recorded phone link, see
+`capture/build/runs/live-1650-direct/report-fec.md`): the earlier layout put
+8 data and 2 parity packets of 1024 bytes on every chunk, padded with zeros,
+and interleaved 4 chunks. A chunk then survived 2 losses of its 10, the
+padding was a fifth of the wire, and every chunk waited ~20 ms for the
+interleave group. With blocks the same parity survives 8 losses in 40 in any
+spread, a chunk without losses waits for nothing, and the stream takes ~20 %
+fewer bytes and ~35 % fewer packets. Replayed through both codecs over the
+recorded link's losses and delays (4 × 170 s; local harness in
+`capture/build/harness`, results in
+`capture/build/runs/harness-blockfec/results.md`): lost chunks 92 → 65,
+delivery delay p50 31.5 → 12.3 ms, p99 ~67 → ~47 ms, packets 446k → 317k.
+
+The data packets of a chunk, and a key frame of several chunks, go back to
+back; at the speed of the network card a shaper on the way (home router,
+provider) cuts off the tail of such a burst. So the server paces the packets
+(`src/pacer.go`, `[pacing] rate_mbit` in `server.cfg`, 30 Mbit/s by default,
+a few times the wire rate). The relay forwards each packet as it comes, so
+this smooths the way to the clients too. The price is the time a big frame
+takes at that rate: ~25 ms for a 75 KB keyframe.
+
+With the defaults the stream on the wire is about 1.5 times the input
+bitrate: 5.5 Mbit/s of video and 256 kbit/s of sound take about 9 Mbit/s.
 
 ### Delay log
 
@@ -263,7 +299,17 @@ terminal, not in the journal). To update, copy the new binary and
    It prints the enrollment (and copies it to the clipboard); send it back.
 
 The server flags: `-cfg server.cfg`, `-keys <dir>` (key directory, default:
-next to the binary), `-sign <key>` and `-days <n>`.
+next to the binary), `-sign <key>`, `-days <n>` and `-trace <file>` (the
+latency trace, see below).
+
+Without OBS, on Linux: `capture/kmsgrab.sh` takes the frames the GPU scans
+out to the monitor (ffmpeg kmsgrab, no copy to memory), encodes HEVC with
+VAAPI and the sound as 5 ms Opus frames, and sends mpegts to the server's
+stream input. It needs a patched ffmpeg (`capture/build-ffmpeg.sh`; KWin
+scans out 10-bit ARGB2101010, which stock ffmpeg 9.0.2 cannot read)
+installed as `/usr/local/bin/ffmpeg-kmsgrab` with `cap_sys_admin`, and
+forces PipeWire's quantum to 256 while it runs; the settings (card, monitor,
+size, fps, bitrate, port) are environment variables, see the script.
 
 ### Client (viewer)
 
@@ -322,10 +368,12 @@ enrollment (shows the client key to send for `server -sign`, takes the
 enrollment back), home (play, profile settings, delete the profile) and the
 stream, full screen in landscape; a tap shows the volume and the link state.
 
-The player keeps close to the live edge by itself (`LiveEdge.kt`): it plays
-at 0.9–1.1x speed to hold a margin of stream ahead of playback, and tunes
-that margin at run time, raising it on each audio underrun and lowering it
-while there are none. Other settings found on a phone: AAudio's low-latency
+The player keeps close to the live edge by itself (`LiveEdge.kt`), at normal
+speed (a changed speed is heard, even with the pitch kept) and without
+seeking (a seek in the live cache stalls longer than it skips): it pauses
+when less than a target margin of stream is ahead of playback, raises the
+margin on each audio underrun, and opens the stream again when it is 1 s
+behind the target. Other settings found on a phone: AAudio's low-latency
 exclusive output (the default shared one lags ~0.3 s), mpv's UDP fifo far
 above the desktop's (it overran and cut holes in the audio), and a longer
 probe than mpv's low-latency profile, without which MediaCodec gets no
@@ -341,8 +389,8 @@ assembleDebug`.
    (`time.google.com` agreed with the PC's system clock within 1 ms; keep
    the PC synced, the marker uses its clock).
 2. Run the server with `-trace trace-server.tsv`.
-3. Open `player/latency-marker.html` in a browser window in the top left
-   quarter of the captured screen. It draws each frame's time as a barcode.
+3. Open `player/latency-marker.html` in a browser window anywhere on the
+   captured screen. It draws each frame's time as a barcode.
 4. In the app, tap the stream and "Measure latency": the app reads the
    barcode off its screen 4 times a second and records the client's trace.
 5. Pull the phone's files and make the report:
@@ -354,7 +402,7 @@ go run ./cmd/latency-report -server trace-server.tsv -client trace-client.tsv -m
 ```
 
 The report times each stage from the frame on the PC's screen to the frame
-on the phone's: the server's (chunking, FEC, interleaving, pacing), the
+on the phone's: the server's (chunking, FEC, pacing), the
 network per packet, the client's (FEC, reordering) and the player's buffer;
 screen capture and OBS encoding are what remains of the measured total.
 

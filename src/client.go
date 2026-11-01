@@ -23,7 +23,6 @@ import (
 type ClientConfig struct {
 	Relay         RelayConfig
 	PlayerPort    uint16 // local UDP port the player reads the mpegts stream from
-	Fec           FecConfig
 	Decoder       DecoderConfig
 	Credentials   wire.Credentials
 	Verifier      wire.CertificateVerifier
@@ -78,10 +77,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.ServerID == uuid.Nil {
 		return nil, errors.New("server id is not set")
 	}
-	decoder, err := codec.NewDecoder(cfg.Fec.DataParts, cfg.Fec.TotalParts, cfg.Decoder.AssemblerSize, cfg.Decoder.DispatcherSize)
+	decoder, err := codec.NewDecoder(cfg.Decoder.DispatcherSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create decoder: %w", err)
 	}
+	decoder.ReorderDeadline = cfg.Decoder.ReorderDeadline
 	return &Client{
 		cfg:     cfg,
 		clock:   ntpclock.New(cfg.NTPServer),
