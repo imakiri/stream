@@ -24,6 +24,7 @@ import (
 func main() {
 	var cfg = flag.String("cfg", "client.cfg", "path to toml config file, see client.example.cfg")
 	var keys = flag.String("keys", "", "key directory; the directory of the binary if empty")
+	var trace = flag.String("trace", "", "write the latency trace of the stream to this file, for cmd/latency-report; needs [clock] ntp_server")
 	flag.Parse()
 
 	var keyDir = *keys
@@ -55,6 +56,13 @@ func main() {
 	client, err := src.NewClient(config)
 	if err != nil {
 		log.Fatalln(err)
+	}
+
+	if *trace != "" {
+		if err := client.StartTrace(*trace); err != nil {
+			log.Fatalln(err)
+		}
+		defer client.StopTrace()
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)

@@ -89,10 +89,10 @@ class PlayerActivity : ComponentActivity() {
         val mpv = MPVLib.create(this) ?: error("libmpv did not load")
         // the desktop settings of player/play-mpv.sh
         mpv.setOptionString("profile", "low-latency")
-        mpv.setOptionString("audio-buffer", "0.05")
-        // scaletempo2 always in: LiveEdge changes the speed, and mpv adding and
-        // removing the filter on each change restarted the audio
-        mpv.setOptionString("af", "scaletempo2")
+        // mpv's own audio buffer is at least the output's: 40 ms here, 20 ms in
+        // OpenSL ES (below), instead of 64 + 64 ms with AAudio, see there
+        mpv.setOptionString("audio-buffer", "0.04")
+        // LiveEdge keeps the speed at 1, so no scaletempo2 (and its ~27 ms)
         // low-latency probes so little that the stream has no picture size yet,
         // and MediaCodec refuses to start without one (width=0, height=0);
         // a longer probe costs only the start
@@ -103,9 +103,16 @@ class PlayerActivity : ComponentActivity() {
         mpv.setOptionString("gpu-context", "android")
         mpv.setOptionString("opengl-es", "yes")
         mpv.setOptionString("hwdec", "mediacodec,mediacodec-copy")
-        mpv.setOptionString("ao", "aaudio,audiotrack")
-        // AAudio's fast path: the default shared, unhinted stream plays through
-        // the mixer's deep buffers, a few hundred ms behind
+        // OpenSL ES: with a 10 ms buffer (and audio-buffer 0.02) the demuxer to
+        // the speaker took ~42 ms on a OnePlus 12, but the output underran ~10
+        // times a minute with a second of stream queued (2026-11-01); 20 ms
+        // (and 0.04) is the next try. AAudio's fast path (exclusive MMAP)
+        // has a fixed 3072-sample (64 ms) buffer there, and mpv 0.41 keeps a
+        // buffer of its own as large as the device's: ~110-145 ms in all.
+        mpv.setOptionString("ao", "opensles,aaudio,audiotrack")
+        mpv.setOptionString("opensles-buffer-size-in-ms", "20")
+        // the AAudio fallback's fast path: the default shared, unhinted stream
+        // plays through the mixer's deep buffers, a few hundred ms behind
         for ((name, value) in listOf("aaudio-performance-mode" to "low-latency", "audio-exclusive" to "yes")) {
             val status = mpv.setOptionString(name, value)
             if (status < 0) android.util.Log.w("stream", "mpv option $name=$value: error $status")
@@ -113,8 +120,26 @@ class PlayerActivity : ComponentActivity() {
         mpv.setOptionString("input-default-bindings", "no")
         mpv.setOptionString("idle", "yes")
         mpv.setOptionString("force-window", "no")
+        applyOverrides(mpv)
         mpv.init()
         return mpv
+    }
+
+    /**
+     * Options from mpv.conf in the profile directory, `name=value` a line, over
+     * the ones above: for trying player settings without building the app.
+     *   adb shell run-as one.imakiri.stream sh -c 'echo audio-buffer=0.02 > files/profile/mpv.conf'
+     */
+    private fun applyOverrides(mpv: MPVLib) {
+        val file = java.io.File(profileDir(this), "mpv.conf")
+        if (!file.exists()) return
+        for (line in file.readLines()) {
+            val text = line.trim()
+            if (text.isEmpty() || text.startsWith("#") || '=' !in text) continue
+            val (name, value) = text.split('=', limit = 2).map { it.trim() }
+            val status = mpv.setOptionString(name, value)
+            android.util.Log.i("stream", "mpv.conf: $name=$value" + if (status < 0) ": error $status" else "")
+        }
     }
 
     @androidx.compose.runtime.Composable
